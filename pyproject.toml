@@ -7,6 +7,9 @@ name = "nowonbun-orchestration-ai-mcp"
 version = "0.1.0"
 description = "Claude/Codex CLI orchestration MCP server with SQLite-backed session memory and SSE streaming"
 requires-python = ">=3.13"
+dependencies = [
+  "mcp[cli]>=1.26,<2"
+]
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
@@ -15,7 +18,7 @@ authors = [
 keywords = ["mcp", "claude", "codex", "sqlite", "sse", "orchestration"]
 
 [project.scripts]
-nowonbun-orchestration-ai-mcp = "orchestrator_mcp.__main__:main"
+nowonbun-orchestration-ai-mcp = "server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
