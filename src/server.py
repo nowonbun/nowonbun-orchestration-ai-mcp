@@ -33,6 +33,8 @@ from mcp.server.fastmcp import FastMCP
 BASE_DIR = Path("D:/work")
 DB_PATH = Path("D:/work/security/orchestrator.sqlite")
 DEFAULT_TIMEOUT_MS = 3000000
+DEFAULT_IDLE_TIMEOUT_SEC = 120
+DEFAULT_ALIVE_LOG_INTERVAL_SEC = 30
 DEFAULT_MCP_PORT = 18282
 DEFAULT_WEB_PORT = 18765
 DEFAULT_GRACEFUL_SHUTDOWN_SEC = 5
@@ -78,6 +80,11 @@ _web_server: ThreadingHTTPServer | None = None
 _web_thread: threading.Thread | None = None
 _shutdown_timer: threading.Timer | None = None
 _shutdown_signal_count = 0
+_active_runs: dict[str, dict[str, Any]] = {}
+_active_runs_lock = threading.Lock()
+_ACTIVE_RUN_OBSERVABILITY_NOTE = (
+    "process/stdout/stderr activity only; internal model reasoning is not directly observable"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +154,58 @@ def _log_tool_result(name: str, result: Any) -> None:
 
 def _json_response(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _serialize_active_run(entry: dict[str, Any], *, now: float) -> dict[str, Any]:
+    return {
+        "runId": entry["runId"],
+        "agent": entry["agent"],
+        "sessionId": entry.get("sessionId"),
+        "pid": entry.get("pid"),
+        "cwd": entry.get("cwd"),
+        "running": True,
+        "startedAt": entry.get("startedAt"),
+        "elapsedSec": round(now - float(entry["startMonotonic"]), 1),
+        "idleSec": round(now - float(entry["lastActivity"]), 1),
+        "stdoutLines": int(entry.get("stdoutLines", 0)),
+        "stderrLines": int(entry.get("stderrLines", 0)),
+        "timeoutMs": int(entry["timeoutMs"]),
+        "idleTimeoutSec": int(entry["idleTimeoutSec"]),
+        "aliveLogIntervalSec": int(entry["aliveLogIntervalSec"]),
+        "observability": "process_io_only",
+        "note": _ACTIVE_RUN_OBSERVABILITY_NOTE,
+    }
+
+
+def _snapshot_active_runs(run_id: str | None = None) -> dict[str, Any]:
+    now = time.monotonic()
+    with _active_runs_lock:
+        if run_id is not None:
+            entry = _active_runs.get(run_id)
+            if entry is None:
+                return {
+                    "running": False,
+                    "runId": run_id,
+                    "run": None,
+                    "observability": "process_io_only",
+                    "note": _ACTIVE_RUN_OBSERVABILITY_NOTE,
+                    "message": "not running or already completed",
+                }
+            return {
+                "running": True,
+                "runId": run_id,
+                "run": _serialize_active_run(entry, now=now),
+                "observability": "process_io_only",
+                "note": _ACTIVE_RUN_OBSERVABILITY_NOTE,
+            }
+
+        runs = [_serialize_active_run(entry, now=now) for entry in _active_runs.values()]
+    return {
+        "count": len(runs),
+        "runs": runs,
+        "observability": "process_io_only",
+        "note": _ACTIVE_RUN_OBSERVABILITY_NOTE,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -453,10 +512,11 @@ def _read_files_for_prompt(
             raise ValueError(f"filePaths target not found: {resolved}")
         if not resolved.is_file():
             raise ValueError(f"filePaths target is not a file: {resolved}")
-        text = resolved.read_text(encoding="utf-8")
+        with resolved.open("r", encoding="utf-8") as handle:
+            text = handle.read(char_limit_per_file + 1)
         if len(text) > char_limit_per_file:
-            text = f"{text[:char_limit_per_file]}\n...<truncated {len(text) - char_limit_per_file} chars>"
-        sections.append(f"[FILE] {resolved}\n{text}")
+            text = f"{text[:char_limit_per_file]}\n...<truncated at {char_limit_per_file} chars>"
+        sections.append(f"[FILE] {resolved}\n{text}\n[END FILE] {resolved}")
     return "\n\n".join(sections)
 
 
@@ -494,6 +554,8 @@ def run_agent_cli(
     timeout_ms: int,
     allowed_tools_pattern: str | None,
     extra_args: list[str],
+    run_id: str | None = None,
+    session_id: str | None = None,
     _internal: bool = False,
 ) -> dict[str, Any]:
     command = _build_command(agent, prompt, allowed_tools_pattern, extra_args, _internal=_internal)
@@ -512,51 +574,144 @@ def run_agent_cli(
         encoding="utf-8",
         errors="replace",
     )
-
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-
-    def consume(stream: Any, buffer: list[str], label: str) -> None:
-        try:
-            for line in iter(stream.readline, ""):
-                buffer.append(line)
-                _log(f"cli.{label}", line=line.rstrip("\n"))
-        finally:
-            stream.close()
-
-    stdout_thread = threading.Thread(target=consume, args=(process.stdout, stdout_chunks, "stdout"), daemon=True)
-    stderr_thread = threading.Thread(target=consume, args=(process.stderr, stderr_chunks, "stderr"), daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-
-    timed_out = False
     try:
-        exit_code = process.wait(timeout=timeout_ms / 1000)
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        process.terminate()
-        try:
-            exit_code = process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            exit_code = process.wait(timeout=2)
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        _log("cli.timeout", agent=agent, timeout_ms=timeout_ms)
-        raise TimeoutError(f"agent timed out after {timeout_ms} ms") from exc
-    finally:
-        if not timed_out:
-            stdout_thread.join(timeout=5)
-            stderr_thread.join(timeout=5)
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        last_activity = time.monotonic()
+        started_at = last_activity
+        activity_lock = threading.Lock()
 
-    result = {
-        "stdout": "".join(stdout_chunks).strip(),
-        "stderr": "".join(stderr_chunks).strip(),
-        "exitCode": int(exit_code),
-    }
-    _log("cli.done", agent=agent, exit_code=result["exitCode"],
-         stdout=_truncate(result["stdout"]), stderr=_truncate(result["stderr"]))
-    return result
+        idle_timeout_sec = int(os.getenv("ORCH_IDLE_TIMEOUT_SEC", str(DEFAULT_IDLE_TIMEOUT_SEC)))
+        alive_log_interval = int(os.getenv("ORCH_ALIVE_LOG_INTERVAL_SEC", str(DEFAULT_ALIVE_LOG_INTERVAL_SEC)))
+        if run_id is not None:
+            with _active_runs_lock:
+                _active_runs[run_id] = {
+                    "runId": run_id,
+                    "agent": agent,
+                    "sessionId": session_id,
+                    "pid": process.pid,
+                    "cwd": working_directory,
+                    "startedAt": _now_iso(),
+                    "startMonotonic": started_at,
+                    "timeoutMs": timeout_ms,
+                    "idleTimeoutSec": idle_timeout_sec,
+                    "aliveLogIntervalSec": alive_log_interval,
+                    "stdoutLines": 0,
+                    "stderrLines": 0,
+                    "lastActivity": last_activity,
+                }
+
+        def touch_activity() -> None:
+            nonlocal last_activity
+            with activity_lock:
+                last_activity = time.monotonic()
+                if run_id is not None:
+                    with _active_runs_lock:
+                        entry = _active_runs.get(run_id)
+                        if entry is not None:
+                            entry["lastActivity"] = last_activity
+
+        def seconds_since_activity() -> float:
+            with activity_lock:
+                return time.monotonic() - last_activity
+
+        def consume(stream: Any, buffer: list[str], label: str) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    buffer.append(line)
+                    touch_activity()
+                    if run_id is not None:
+                        with _active_runs_lock:
+                            entry = _active_runs.get(run_id)
+                            if entry is not None:
+                                key = "stdoutLines" if label == "stdout" else "stderrLines"
+                                entry[key] = len(buffer)
+                    _log(f"cli.{label}", line=line.rstrip("\n"))
+            finally:
+                stream.close()
+
+        stdout_thread = threading.Thread(target=consume, args=(process.stdout, stdout_chunks, "stdout"), daemon=True)
+        stderr_thread = threading.Thread(target=consume, args=(process.stderr, stderr_chunks, "stderr"), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        hard_deadline = started_at + (timeout_ms / 1000)
+        last_alive_log = started_at
+        timed_out = False
+        timeout_reason = ""
+        try:
+            while True:
+                try:
+                    exit_code = process.wait(timeout=2.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+
+                now = time.monotonic()
+                idle_sec = seconds_since_activity()
+                elapsed_sec = now - started_at
+
+                if now - last_alive_log >= alive_log_interval:
+                    _log(
+                        "cli.alive",
+                        agent=agent,
+                        run_id=run_id,
+                        elapsed_sec=round(elapsed_sec, 1),
+                        idle_sec=round(idle_sec, 1),
+                        stdout_lines=len(stdout_chunks),
+                        stderr_lines=len(stderr_chunks),
+                    )
+                    last_alive_log = now
+
+                if idle_sec >= idle_timeout_sec:
+                    timed_out = True
+                    timeout_reason = f"idle for {idle_sec:.0f}s (no output)"
+                    break
+
+                if now >= hard_deadline:
+                    timed_out = True
+                    timeout_reason = f"hard timeout after {timeout_ms}ms"
+                    break
+        except Exception:
+            timed_out = True
+            timeout_reason = "unexpected error during wait"
+        finally:
+            if timed_out:
+                process.terminate()
+                try:
+                    exit_code = process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    exit_code = process.wait(timeout=2)
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+            else:
+                stdout_thread.join(timeout=5)
+                stderr_thread.join(timeout=5)
+
+        if timed_out:
+            _log(
+                "cli.timeout",
+                agent=agent,
+                run_id=run_id,
+                timeout_ms=timeout_ms,
+                reason=timeout_reason,
+                idle_sec=round(seconds_since_activity(), 1),
+            )
+            raise TimeoutError(f"agent timed out: {timeout_reason}")
+
+        result = {
+            "stdout": "".join(stdout_chunks).strip(),
+            "stderr": "".join(stderr_chunks).strip(),
+            "exitCode": int(exit_code),
+        }
+        _log("cli.done", agent=agent, run_id=run_id, exit_code=result["exitCode"],
+             stdout=_truncate(result["stdout"]), stderr=_truncate(result["stderr"]))
+        return result
+    finally:
+        if run_id is not None:
+            with _active_runs_lock:
+                _active_runs.pop(run_id, None)
 
 
 
@@ -1294,6 +1449,7 @@ class SessionStore:
             compiled_prompt=_truncate(compiled_prompt),
         )
 
+        run_id = str(uuid4())
         result = run_agent_cli(
             agent=agent,
             prompt=compiled_prompt,
@@ -1301,6 +1457,8 @@ class SessionStore:
             timeout_ms=int(timeout_ms or self.default_timeout_ms),
             allowed_tools_pattern=allowed_tools_pattern,
             extra_args=extra_args or [],
+            run_id=run_id,
+            session_id=active_session_id,
             _internal=_internal,
         )
         status = "completed" if result["exitCode"] == 0 else "failed"
@@ -1323,7 +1481,7 @@ class SessionStore:
         _log("agent.session_saved", session_id=active_session_id, agent=agent, status=status)
 
         payload: dict[str, Any] = {
-            "runId": str(uuid4()),
+            "runId": run_id,
             "sessionId": active_session_id,
             "agent": agent,
             "exitCode": result["exitCode"],
@@ -2352,27 +2510,38 @@ def orchestrator_usage() -> dict[str, Any]:
                     "filePaths": "(선택 사항) 서버가 UTF-8로 직접 읽어 프롬프트에 주입할 로컬 파일 경로 배열",
                     "allowedToolsPattern": "(선택 사항) CLI에 전달할 허용 도구 패턴. 기본값 '*'",
                     "cwd": "(선택 사항) CLI 실행 디렉터리",
-                    "timeoutMs": "(선택 사항) 타임아웃 ms. 기본값 120000",
+                    "timeoutMs": f"(선택 사항) 하드 타임아웃 ms. 기본값 {DEFAULT_TIMEOUT_MS}",
                     "extraArgs": "(선택 사항) CLI에 전달할 추가 인수 문자열 배열",
                     "skipPermissions": "(선택 사항) true: claude에 --dangerously-skip-permissions 전달. stdin 없이 도구 실행 시 권한 오류 방지. 기본값 false",
                 },
                 "returns": {
+                    "runId": "실행 ID",
                     "sessionId": "사용된 세션 ID",
                     "status": "'completed' 또는 'failed'",
                     "stdout": "CLI 표준 출력(응답 본문)",
                     "stderr": "CLI 표준 에러 출력",
                     "exitCode": "프로세스 종료 코드(0 = 성공)",
                 },
+                "timeout_behavior": {
+                    "idleTimeoutSec": "ORCH_IDLE_TIMEOUT_SEC 또는 DEFAULT_IDLE_TIMEOUT_SEC",
+                    "aliveLogIntervalSec": "ORCH_ALIVE_LOG_INTERVAL_SEC 또는 DEFAULT_ALIVE_LOG_INTERVAL_SEC",
+                    "observability": "stdout/stderr 활동 기준으로만 관측",
+                },
                 "example": {
                     "call": 'agent_run(agent="claude", prompt="Python으로 피보나치 수열을 작성해 줘")',
                     "continuation": 'agent_run(agent="claude", prompt="재귀 버전으로 바꿔 줘", sessionId="<이전 sessionId>")',
                 },
+            },
+            "agent_run_status": {
+                "purpose": "실행 중 agent_run의 프로세스/I/O 상태 조회",
+                "params": {"runId": "(선택 사항) 실행 ID. 생략 시 전체 실행 중 목록 반환"},
             },
         },
         "notes": [
             "role은 'user'와 'assistant'만 사용할 수 있습니다('system'은 미지원).",
             "세션을 사용하면 이전 user/assistant 메시지가 자동으로 프롬프트에 포함됩니다.",
             "긴 프롬프트는 promptBase64로 Base64 인코딩하여 전달할 수 있습니다.",
+            "agent_run_status는 프로세스/stdout/stderr 활동만 관측하며 내부 모델 추론 상태는 직접 알 수 없습니다.",
         ],
     }
     _log_tool_result("orchestrator_usage", {"keys": list(guide.keys())})
@@ -2436,6 +2605,14 @@ def session_delete(sessionId: str) -> dict[str, Any]:
     _log_tool_call("session_delete", sessionId=sessionId)
     result = _get_store().delete_session(sessionId)
     _log_tool_result("session_delete", result)
+    return result
+
+
+@mcp.tool(name="agent_run_status", description="실행 중 agent_run의 프로세스/I/O 상태를 반환합니다.")
+def agent_run_status(runId: str | None = None) -> dict[str, Any]:
+    _log_tool_call("agent_run_status", runId=runId)
+    result = _snapshot_active_runs(runId)
+    _log_tool_result("agent_run_status", result)
     return result
 
 

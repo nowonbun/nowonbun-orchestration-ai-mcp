@@ -23,13 +23,17 @@ Python에서 `claude -p`와 `codex exec`를 호출하고, MCP Tool과 SQLite 세
 BASE_DIR = Path("D:/work")  # CLI 실행 시 기본 작업 디렉터리
 DB_PATH = Path("D:/work/security/orchestrator.sqlite")  # SQLite DB 경로
 DEFAULT_TIMEOUT_MS = 3000000                   # CLI 실행 타임아웃(ms)
+DEFAULT_IDLE_TIMEOUT_SEC = 120                 # 출력이 없을 때 idle timeout(초)
+DEFAULT_ALIVE_LOG_INTERVAL_SEC = 30            # 진행 중 alive 로그 간격(초)
 DEFAULT_MCP_PORT = 18282                       # MCP 포트
 DEFAULT_WEB_PORT = 18765                       # Web UI 포트
 ```
 
 - `BASE_DIR`: `agent_run`에서 `cwd`를 지정하지 않았을 때 CLI가 실행될 디렉터리. 이 디렉터리의 `.mcp.json`, `CLAUDE.md`, skills가 CLI에 적용된다.
 - `DB_PATH`: SQLite 데이터베이스 파일 경로. DB 저장 위치는 Configuration 섹션에서 직접 수정한다.
-- `DEFAULT_TIMEOUT_MS`: CLI 실행 기본 타임아웃.
+- `DEFAULT_TIMEOUT_MS`: CLI 실행 hard timeout 기본값.
+- `DEFAULT_IDLE_TIMEOUT_SEC`: stdout/stderr 출력이 없는 상태가 유지될 때 적용되는 idle timeout 기본값.
+- `DEFAULT_ALIVE_LOG_INTERVAL_SEC`: 장시간 실행 중 `cli.alive` 로그를 남기는 기본 간격.
 - `D:/work/security`: `filePaths` 주입 경로에서 차단되는 보안 루트다.
 
 ## 실행 방법
@@ -89,6 +93,7 @@ url = "http://127.0.0.1:18282/mcp/"
 | `session_append` | 기존 세션에 메시지 수동 추가 |
 | `session_delete` | 세션과 관련 메시지 삭제 |
 | `agent_run` | Claude/Codex CLI 실행 후 결과를 세션에 저장 |
+| `agent_run_status` | 현재 실행 중인 `agent_run`의 프로세스/I/O 상태 조회 |
 
 ## CLI 실행 사양
 
@@ -106,6 +111,21 @@ url = "http://127.0.0.1:18282/mcp/"
 - `filePaths`로 `D:/work/security` 하위 경로는 읽을 수 없다.
 - `extraArgs`에는 `--allowedTools`, `--allowed-tools`, `--dangerously-skip-permissions`, `--sandbox`, `--ask-for-approval`, `--add-dir`, `--dangerously-bypass-approvals-and-sandbox`를 넣을 수 없다.
 - `skipPermissions`는 `agent="claude"`일 때만 내부적으로 `--dangerously-skip-permissions`를 추가하며, 다른 agent에서는 전달해도 효과가 없다.
+
+### timeout 동작
+
+- `timeoutMs`는 전체 실행 시간에 대한 hard timeout으로 동작한다.
+- stdout/stderr 출력이 `ORCH_IDLE_TIMEOUT_SEC` 동안 없으면 idle timeout으로 중단된다.
+- `ORCH_IDLE_TIMEOUT_SEC`를 지정하지 않으면 `DEFAULT_IDLE_TIMEOUT_SEC`(기본 120초)를 사용한다.
+- `ORCH_ALIVE_LOG_INTERVAL_SEC`를 지정하지 않으면 `DEFAULT_ALIVE_LOG_INTERVAL_SEC`(기본 30초) 간격으로 `cli.alive` 로그를 남긴다.
+- timeout 발생 시 서버는 먼저 terminate를 시도하고, 종료되지 않으면 kill로 정리한다.
+
+### `agent_run_status` 동작
+
+- `agent_run_status()`는 현재 실행 중인 run만 보여준다. 완료된 run은 목록에서 제거된다.
+- `runId`를 생략하면 현재 활성 run 전체를 반환한다. 다른 클라이언트나 다른 PC에서 진행 상태를 확인할 때 기본적으로 이 방식을 사용한다.
+- `runId`를 지정하면 해당 run이 아직 실행 중인지와 stdout/stderr 활동 기준 idle 시간, 누적 출력 줄 수를 조회할 수 있다.
+- 이 상태 조회는 프로세스/표준출력/표준에러 활동만 관찰한다. 모델 내부 추론 단계 자체를 직접 보여주지는 않는다.
 
 ## 파일 구성
 
