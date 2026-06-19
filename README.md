@@ -21,10 +21,12 @@ Python에서 `claude -p`와 `codex exec`를 호출하고, MCP Tool과 SQLite 세
 
 ```python
 BASE_DIR = Path("/Users/soonyub.hwang/desk")  # CLI 실행 시 기본 작업 디렉터리
+DB_PATH = Path("/Users/soonyub.hwang/desk/data/orchestrator.sqlite")  # SQLite DB 경로
 DEFAULT_TIMEOUT_MS = 3000000                   # CLI 실행 타임아웃(ms)
 ```
 
 - `BASE_DIR`: `agent_run`에서 `cwd`를 지정하지 않았을 때 CLI가 실행될 디렉터리. 이 디렉터리의 `.mcp.json`, `CLAUDE.md`, skills가 CLI에 적용된다.
+- `DB_PATH`: SQLite 데이터베이스 파일 경로. DB 저장 위치는 Configuration 섹션에서 직접 수정한다.
 - `DEFAULT_TIMEOUT_MS`: CLI 실행 기본 타임아웃.
 
 ## 실행 방법

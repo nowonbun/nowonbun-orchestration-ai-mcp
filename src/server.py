@@ -29,8 +29,8 @@ from mcp.server.fastmcp import FastMCP
 # Configuration
 # ---------------------------------------------------------------------------
 
-#BASE_DIR = Path("/Users/soonyub.hwang/Works/github/lsm")
-BASE_DIR = Path("/Users/soonyub.hwang/desk")
+BASE_DIR = Path("D:/work")
+DB_PATH = Path("D:/work/security/orchestrator.sqlite")
 DEFAULT_TIMEOUT_MS = 3000000
 
 # ---------------------------------------------------------------------------
@@ -86,6 +86,22 @@ def _truncate(text: str, limit: int = 2000) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}\n...<truncated {len(text) - limit} chars>"
+
+
+def _looks_like_file_review_failure(stdout: str) -> bool:
+    lowered = (stdout or "").lower()
+    patterns = (
+        "\uc5b4\ub5a4 \ud30c\uc77c",
+        "\uc5b4\ub5a4 3\uac1c\uc758 \ud30c\uc77c",
+        "\ud30c\uc77c\uc744 \uac80\ud1a0\ud560\uc9c0",
+        "\ud30c\uc77c\uc744 \uc9c0\uc815",
+        "\uc54c\ub824\uc8fc\uc2dc\uaca0\uc2b5\ub2c8\uae4c",
+        "which file",
+        "which files",
+        "specify the file",
+        "specify which file",
+    )
+    return any(pattern in lowered for pattern in patterns)
 
 
 def _log(event: str, **fields: Any) -> None:
@@ -288,6 +304,18 @@ def compile_claude_parts(messages: list[dict[str, Any]] | None) -> str:
     return "\n".join(user_parts).strip()
 
 
+def build_claude_review_prompt(prompt: str) -> str:
+    prefix = (
+        "Review mode.\n"
+        "You must read every referenced local file path before answering.\n"
+        "If any referenced file cannot be read, output exactly: BLOCKED|file-unreadable\n"
+        "Do not ask follow-up questions.\n"
+        "Do not guess.\n"
+        "Follow the user's requested output format exactly.\n\n"
+    )
+    return f"{prefix}{prompt}".strip()
+
+
 def compile_codex_prompt(messages: list[dict[str, Any]] | None) -> str:
     """Codex용 프롬프트 — [ROLE] 태그 없이 직접 전달한다."""
     normalized = normalize_messages(messages)
@@ -311,6 +339,21 @@ def compile_codex_prompt(messages: list[dict[str, Any]] | None) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve_cli_command(name: str) -> str:
+    if os.name == "nt" and name == "claude":
+        appdata = os.getenv("APPDATA")
+        if appdata:
+            direct_exe = (
+                Path(appdata)
+                / "npm"
+                / "node_modules"
+                / "@anthropic-ai"
+                / "claude-code"
+                / "bin"
+                / "claude.exe"
+            )
+            if direct_exe.exists():
+                return str(direct_exe)
+
     direct = shutil.which(name)
     if direct:
         return direct
@@ -336,6 +379,44 @@ def _validate_extra_args(args: list[str]) -> None:
     for arg in args:
         if arg.split("=")[0] in _BLOCKED_EXTRA_ARGS:
             raise ValueError(f"extra_args contains blocked argument: {arg!r}")
+
+
+def _normalize_injected_file_paths(file_paths: list[str] | None) -> list[str]:
+    if file_paths is None:
+        return []
+    if not isinstance(file_paths, list):
+        raise ValueError("filePaths must be a list")
+    normalized: list[str] = []
+    for raw in file_paths:
+        value = str(raw).strip()
+        if value:
+            normalized.append(value)
+    return normalized
+
+
+def _read_files_for_prompt(file_paths: list[str], *, char_limit_per_file: int = 12000) -> str:
+    if not file_paths:
+        return ""
+
+    sections: list[str] = []
+    security_root = Path("D:/work/security").resolve()
+    for raw_path in file_paths:
+        resolved = Path(raw_path).resolve()
+        try:
+            resolved.relative_to(security_root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("\ubcf4\uc548 \uc815\ucc45\uc5d0 \uc758\ud574 \uc811\uadfc\uc774 \uac70\ubd80\ub418\uc5c8\uc2b5\ub2c8\ub2e4")
+        if not resolved.exists():
+            raise ValueError(f"filePaths target not found: {resolved}")
+        if not resolved.is_file():
+            raise ValueError(f"filePaths target is not a file: {resolved}")
+        text = resolved.read_text(encoding="utf-8")
+        if len(text) > char_limit_per_file:
+            text = f"{text[:char_limit_per_file]}\n...<truncated {len(text) - char_limit_per_file} chars>"
+        sections.append(f"[FILE] {resolved}\n{text}")
+    return "\n\n".join(sections)
 
 
 def _build_command(
@@ -378,6 +459,7 @@ def run_agent_cli(
     working_directory = str(Path(cwd).resolve()) if cwd else None
     _log("cli.start", agent=agent, cwd=working_directory, timeout_ms=timeout_ms,
          allowed_tools_pattern=allowed_tools_pattern)
+    _log("cli.command", command=command)
 
     process = subprocess.Popen(
         command,
@@ -1021,6 +1103,7 @@ class SessionStore:
         use_session: bool = True,
         session_id: str | None = None,
         messages: list[dict[str, Any]] | None = None,
+        file_paths: list[str] | None = None,
         allowed_tools_pattern: str | None = "*",
         cwd: str | None = None,
         timeout_ms: int | None = None,
@@ -1034,6 +1117,7 @@ class SessionStore:
 
         active_session_id = self._resolve_session(agent, session_id)
         supplemental = normalize_messages(messages)
+        injected_file_paths = _normalize_injected_file_paths(file_paths)
         current_messages = self._build_current_messages(prompt, supplemental)
         self.append_messages(active_session_id, current_messages, agent=agent, is_session=use_session)
 
@@ -1041,6 +1125,10 @@ class SessionStore:
 
         if agent == "claude":
             compiled_prompt = compile_claude_parts(request_messages)
+            if injected_file_paths:
+                injected_files = _read_files_for_prompt(injected_file_paths)
+                compiled_prompt = f"{compiled_prompt}\n\n[INJECTED FILE CONTENTS]\n{injected_files}".strip()
+                compiled_prompt = build_claude_review_prompt(compiled_prompt)
         else:
             compiled_prompt = compile_codex_prompt(request_messages)
 
@@ -1064,6 +1152,10 @@ class SessionStore:
             _internal=_internal,
         )
         status = "completed" if result["exitCode"] == 0 else "failed"
+        if agent == "claude" and injected_file_paths and _looks_like_file_review_failure(result["stdout"]):
+            status = "failed"
+            failure_note = "[LOGICAL REVIEW FAILURE] Claude did not follow injected file review instructions."
+            result["stderr"] = f"{result['stderr']}\n{failure_note}".strip()
 
         assistant_content = (
             result["stdout"] or "(empty response)"
@@ -1087,6 +1179,8 @@ class SessionStore:
             "stdout": result["stdout"],
             "stderr": result["stderr"],
         }
+        if injected_file_paths:
+            payload["filePaths"] = injected_file_paths
         if _env_flag("ORCH_DEBUG", True):
             payload["compiledPrompt"] = compiled_prompt
         _log("agent.result", result=_truncate(_safe_json(payload)))
@@ -1642,7 +1736,7 @@ def _get_base_dir() -> Path:
 
 
 def _get_db_path() -> Path:
-    return Path(os.getenv("ORCH_DB_PATH", str(_get_root_dir() / "data" / "orchestrator.sqlite"))).resolve()
+    return DB_PATH.resolve()
 
 
 def _get_transport() -> Transport:
@@ -1786,10 +1880,12 @@ def orchestrator_usage() -> dict[str, Any]:
                     "useSession": "(선택 사항) true: 세션 기록 사용. 기본값 true",
                     "sessionId": "(선택 사항) 기존 세션 ID. 생략 시 새로 생성",
                     "messages": "(선택 사항) 추가 컨텍스트 메시지 [{role, content}]",
+                    "filePaths": "(선택 사항) 서버가 UTF-8로 직접 읽어 프롬프트에 주입할 로컬 파일 경로 배열",
                     "allowedToolsPattern": "(선택 사항) CLI에 전달할 허용 도구 패턴. 기본값 '*'",
                     "cwd": "(선택 사항) CLI 실행 디렉터리",
                     "timeoutMs": "(선택 사항) 타임아웃 ms. 기본값 120000",
                     "extraArgs": "(선택 사항) CLI에 전달할 추가 인수 문자열 배열",
+                    "skipPermissions": "(선택 사항) true: claude에 --dangerously-skip-permissions 전달. stdin 없이 도구 실행 시 권한 오류 방지. 기본값 false",
                 },
                 "returns": {
                     "sessionId": "사용된 세션 ID",
@@ -1883,10 +1979,12 @@ def agent_run(
     useSession: bool = True,
     sessionId: str | None = None,
     messages: list[dict[str, Any]] | None = None,
+    filePaths: list[str] | None = None,
     allowedToolsPattern: str | None = "*",
     cwd: str | None = None,
     timeoutMs: int | None = None,
     extraArgs: list[str] | None = None,
+    skipPermissions: bool = False,
 ) -> dict[str, Any]:
     resolved_prompt = _resolve_text_value(prompt, promptBase64, field_name="prompt")
     _log_tool_call(
@@ -1895,20 +1993,27 @@ def agent_run(
         prompt=_truncate(resolved_prompt),
         useSession=useSession,
         sessionId=sessionId,
+        filePaths=filePaths,
         allowedToolsPattern=allowedToolsPattern,
         cwd=cwd,
         timeoutMs=timeoutMs,
+        skipPermissions=skipPermissions,
     )
+    resolved_extra: list[str] = list(extraArgs or [])
+    if skipPermissions and agent == "claude":
+        resolved_extra.append("--dangerously-skip-permissions")
     result = _get_store().run_agent(
         agent=agent,
         prompt=resolved_prompt,
         use_session=useSession,
         session_id=sessionId,
         messages=messages,
+        file_paths=filePaths,
         allowed_tools_pattern=allowedToolsPattern,
         cwd=cwd,
         timeout_ms=timeoutMs,
-        extra_args=extraArgs,
+        extra_args=resolved_extra,
+        _internal=skipPermissions,
     )
     _log_tool_result("agent_run", result)
     return result

@@ -22,7 +22,7 @@ Browser
          └─ ThreadingHTTPServer (Web UI)
 
 src/server.py
-    ├─ Configuration       # BASE_DIR, DEFAULT_TIMEOUT_MS
+    ├─ Configuration       # BASE_DIR, DB_PATH, DEFAULT_TIMEOUT_MS
     ├─ SessionStore        # SQLite schema / CRUD / agent 실행
     ├─ run_agent_cli       # claude -p / codex exec subprocess
     ├─ compile_claude_parts / compile_codex_prompt  # 메시지→프롬프트 변환
@@ -55,12 +55,14 @@ mcp-orchestration-ai/
 
 ```python
 BASE_DIR = Path("/Users/soonyub.hwang/desk")
+DB_PATH = Path("/Users/soonyub.hwang/desk/data/orchestrator.sqlite")
 DEFAULT_TIMEOUT_MS = 3000000
 ```
 
 | 설정 | 설명 |
 |---|---|
 | `BASE_DIR` | `agent_run`에서 `cwd` 미지정 시 사용할 CLI 작업 디렉터리. 이 디렉터리의 Claude/Codex 프로젝트 설정이 적용된다 |
+| `DB_PATH` | SQLite 데이터베이스 파일 경로. DB 저장 위치는 Configuration 섹션에서 직접 수정한다 |
 | `DEFAULT_TIMEOUT_MS` | CLI 실행 기본 타임아웃(ms) |
 
 환경 변수(서버 시작 매개변수):
@@ -69,7 +71,6 @@ DEFAULT_TIMEOUT_MS = 3000000
 |---|---|---|
 | `ORCH_HOST` | `127.0.0.1` | MCP 서버 bind host |
 | `ORCH_PORT` | `18282` | MCP 서버 port |
-| `ORCH_DB_PATH` | `<root>/data/orchestrator.sqlite` | SQLite DB 경로 |
 | `ORCH_SCHEDULER_INTERVAL_SECONDS` | `30` | due job polling 간격(초) |
 | `ORCH_WEB_ENABLED` | `true` | Web UI 시작 여부 |
 | `ORCH_WEB_HOST` | `127.0.0.1` | Web UI bind host |
