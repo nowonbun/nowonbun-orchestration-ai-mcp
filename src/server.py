@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import anyio
 import base64
 import contextlib
 import html
@@ -34,6 +35,7 @@ DB_PATH = Path("D:/work/security/orchestrator.sqlite")
 DEFAULT_TIMEOUT_MS = 3000000
 DEFAULT_MCP_PORT = 18282
 DEFAULT_WEB_PORT = 18765
+DEFAULT_GRACEFUL_SHUTDOWN_SEC = 5
 MANUAL_ONLY_MARKER = "- - - - - -"
 CLAUDE_REVIEW_PROMPT_PREFIX = (
     "Review mode.\n"
@@ -1286,6 +1288,7 @@ def _html_page(title: str, body: str) -> bytes:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(title)}</title>
+  <link rel="icon" type="image/jpeg" href="data:image/jpeg;base64,/9j/2wCEAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDIBCQkJDAsMGA0NGDIhHCEyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMv/AABEIAEAAQAMBIgACEQEDEQH/xAGiAAABBQEBAQEBAQAAAAAAAAAAAQIDBAUGBwgJCgsQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+gEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoLEQACAQIEBAMEBwUEBAABAncAAQIDEQQFITEGEkFRB2FxEyIygQgUQpGhscEJIzNS8BVictEKFiQ04SXxFxgZGiYnKCkqNTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqCg4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2gAMAwEAAhEDEQA/APM/tLk5yeeuep/z6VSv2aWFgTnNWQuRSSwbkNcEZWZ6U4to52OEs2K17DR5bo/KppbKx824K9OM13C6xo3hKzZLmF7m8lhVo41HAPqx7DitJ1ndRhqzmjSVm5bHHTaJNC2Ch/Kp7PRpZGxtP5U658XXuoyl/LgjJOdqxZX8K6bwfrdlqd2tjeJHBdtxGwPyyew9DUV516cHKxdFUZSszMXw+4HKH8qadCYH7tepvpKAH5R0qsdHDMflA4rzaeYSkz0XhYJHj6NjAqXcMVUV+Pen7+K7uU5+Y0LFVWUN3rDYrqOtXM95J+7VyOTjgcAfkK2rNs7OcVnwWRF7eLEULCc4JGQB16fjWlD4mZVldI7jw2NIt7fzJEtXiPUtGGAH403xZBoAht9U8PSwboJB54iGNpzkNjtz6cVS0W0edLqJ2AdIg2QuBnPpWpZ6O50u9GoXYMZgcIpQckjjBH4V2uKtczlFtJWPSbG4Go6VaXox++hWTgccjNK0e3Gf0qLw+iw+GdMjySFtY1yf90VPMBg8H86+VdHkm0u56cJ3irnzaHxTxJ8tQEEUAnFe/Y8+5q2koWNSasRqouzKh+/1HvVK2hkmVI4o3d24CoMk/hWkthcxTNDKhjlj6oeqn0PpUxTUtDWLuieG8e21AkTzRZwT5aZbHtxXVaaBfXEESljDI3KOP4e+R9K5m2f58SwlmX8DXoXhOxQ2st/LHiRyVjH91f8A65/zzXbKXLC5inqdXtEcQVcBQMAen+f8+1OeX5MDrVljlFzjkf5/z/kZ84wpx1FeTKlqdEJnBeB/AaapOl5qtvIbcgGGFSoMn+0c9v516k+haRa26WzadC9rGRm2uLdPkyeoAGCM101lFFYxJGihokACsTkqPy6VQ165hkhkRwEmhXcOeqn09q7acb7nLOd2Vml0zTdDkXT7C3toz0jgjCfMe/HevKtQ8OXaTPewgzq5LOQPmGfUV2sDtc28WTxyf1Natla4YHpXdRoxn8RhOrKn8J5pZ6XLMM7ACO5713ugaVcS6WYol3Sw8svqp9P14rqYrWKVdjxRnJHzFBkVu2sMcOQgUD2AFKtT6MmOJ5tEjzyRNg2sjK46huo/z/ntihcN8h55BxXo+t6Qmo2jtGoW5UZRvX2NeZXTHDZHI6iuKcLM6adTmP/Z">
   <style>
     :root {{
       --bg-primary: #0f1923;
@@ -1403,7 +1406,7 @@ def _html_page(title: str, body: str) -> bytes:
     .toast.success {{ border-color: rgba(16,185,129,0.35); }}
     .btn[disabled] {{ opacity: 0.65; cursor: wait; }}
 
-    .loading-overlay {{ display: none; position: fixed; inset: 0; background: rgba(15,25,35,0.8); z-index: 3000; align-items: center; justify-content: center; flex-direction: column; gap: 16px; }}
+    .loading-overlay {{ display: none; position: fixed; inset: 0; background: rgba(15,25,35,0.8); z-index: 3000; align-items: center; justify-content: center; flex-direction: column; gap: 16px; pointer-events: all; }}
     .loading-overlay.active {{ display: flex; }}
     .loading-spinner {{ width: 40px; height: 40px; border: 3px solid rgba(255,255,255,0.12); border-top-color: var(--accent-blue); border-radius: 50%; animation: spin 0.8s linear infinite; }}
     @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
@@ -1593,6 +1596,12 @@ document.querySelectorAll('form[action="/schedule/run"]').forEach(function(form)
     const btn = form.querySelector('button[type="submit"]');
     if (btn && btn.disabled) return;
     const jobItem = form.closest('[data-job-id]');
+    if (btn) {{
+      btn.disabled = true;
+      btn.style.opacity = '0.5';
+      btn.style.cursor = 'not-allowed';
+    }}
+    showLoading('배치 실행 중... 완료될 때까지 기다려주세요.');
     fetch(form.action, {{
       method: 'POST',
       headers: {{
@@ -1604,7 +1613,16 @@ document.querySelectorAll('form[action="/schedule/run"]').forEach(function(form)
     }})
       .then(function(r) {{ return r.json(); }})
       .then(function(payload) {{
-        if (!payload.ok) {{ showToast(payload.error || '실행 실패', 'error'); return; }}
+        if (!payload.ok) {{
+          hideLoading();
+          if (btn) {{
+            btn.disabled = false;
+            btn.style.opacity = '';
+            btn.style.cursor = '';
+          }}
+          showToast(payload.error || '실행 실패', 'error');
+          return;
+        }}
         if (jobItem) {{
           var badge = jobItem.querySelector('[data-status-badge]');
           var runBtn = jobItem.querySelector('[data-run-btn]');
@@ -1613,7 +1631,15 @@ document.querySelectorAll('form[action="/schedule/run"]').forEach(function(form)
         }}
         if (window._startJobPolling) window._startJobPolling();
       }})
-      .catch(function(err) {{ showToast(err.message || '네트워크 오류', 'error'); }});
+      .catch(function(err) {{
+        hideLoading();
+        if (btn) {{
+          btn.disabled = false;
+          btn.style.opacity = '';
+          btn.style.cursor = '';
+        }}
+        showToast(err.message || '네트워크 오류', 'error');
+      }});
   }});
 }});
 
@@ -1641,6 +1667,7 @@ document.querySelectorAll('form[action="/schedule/toggle"]').forEach(function(fo
 
 (function() {{
   var _pollTimer = null;
+  var _runLoadingText = '배치 실행 중... 완료될 때까지 기다려주세요.';
 
   function _updateJobStatus(job) {{
     var item = document.querySelector('[data-job-id="' + job.id + '"]');
@@ -1671,6 +1698,7 @@ document.querySelectorAll('form[action="/schedule/toggle"]').forEach(function(fo
         var label = document.getElementById('runningLabel');
         var subtitle = document.getElementById('dashboardSubtitle');
         if (runningCount > 0) {{
+          showLoading(_runLoadingText);
           if (!label && subtitle) {{
             var span = document.createElement('span');
             span.id = 'runningLabel';
@@ -1682,6 +1710,7 @@ document.querySelectorAll('form[action="/schedule/toggle"]').forEach(function(fo
             label.textContent = '실행 중 ' + runningCount + '개';
           }}
         }} else {{
+          hideLoading();
           if (label) {{ label.parentNode.removeChild(label.previousSibling); label.parentNode.removeChild(label); }}
           clearInterval(_pollTimer);
           _pollTimer = null;
@@ -1696,6 +1725,7 @@ document.querySelectorAll('form[action="/schedule/toggle"]').forEach(function(fo
   }}
 
   if (document.querySelector('[data-status-badge].running')) {{
+    showLoading(_runLoadingText);
     _startPolling();
   }}
 
@@ -1845,7 +1875,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
 
         # 최근 활동
         activity_items = []
-        for run in runs[:8]:
+        for run in runs[:5]:
             status_class = "success" if run["status"] == "completed" else ("running" if run["status"] == "running" else "failed")
             job_name = next((j["name"] for j in jobs if j["id"] == run["jobId"]), run["jobId"][:8])
             activity_items.append(f"""
@@ -1949,14 +1979,14 @@ class WebUiHandler(BaseHTTPRequestHandler):
 
   <div style="display:flex;flex-direction:column;gap:24px;">
     <div class="card">
-      <h2>Recent Activity</h2>
-      {f'<ul class="activity-list">{"".join(activity_items)}</ul>' if activity_items else '<div class="empty">실행 기록 없음</div>'}
-      <div style="margin-top:12px;"><a href="/runs">모든 실행 기록 보기 →</a></div>
+      <h2>Active Schedules</h2>
+      {f'<ul class="schedule-list">{"".join(schedule_items)}</ul>' if schedule_items else '<div class="empty">등록된 스케줄 없음</div>'}
     </div>
 
     <div class="card">
-      <h2>Active Schedules</h2>
-      {f'<ul class="schedule-list">{"".join(schedule_items)}</ul>' if schedule_items else '<div class="empty">등록된 스케줄 없음</div>'}
+      <h2>Recent Activity</h2>
+      {f'<ul class="activity-list">{"".join(activity_items)}</ul>' if activity_items else '<div class="empty">실행 기록 없음</div>'}
+      <div style="margin-top:12px;"><a href="/runs">모든 실행 기록 보기 →</a></div>
     </div>
   </div>
 </div>
@@ -2046,6 +2076,23 @@ def _get_db_path() -> Path:
 
 def _get_transport() -> Transport:
     return "streamable-http"
+
+
+async def _run_mcp_server_async() -> None:
+    import uvicorn
+
+    starlette_app = mcp.streamable_http_app()
+    config = uvicorn.Config(
+        starlette_app,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+        timeout_graceful_shutdown=int(
+            os.getenv("ORCH_GRACEFUL_SHUTDOWN_SEC", str(DEFAULT_GRACEFUL_SHUTDOWN_SEC))
+        ),
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 def _get_store() -> SessionStore:
@@ -2344,7 +2391,7 @@ def main() -> None:
     _initialize()
     exit_code = 0
     try:
-        mcp.run(transport=_get_transport())
+        anyio.run(_run_mcp_server_async)
     except KeyboardInterrupt:
         exit_code = 130
         _log("process.keyboard_interrupt")
