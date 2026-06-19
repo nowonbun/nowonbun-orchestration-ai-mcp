@@ -51,11 +51,13 @@ Claude Code의 MCP 설정(`~/.claude/settings.json` 또는 프로젝트 `.mcp.js
 {
   "mcpServers": {
     "orchestration-ai": {
-      "type": "url",
+      "type": "http",
       "url": "http://127.0.0.1:18282/mcp/"
     }
   }
 }
+
+claude mcp add --transport http orchestration-ai http://127.0.0.1:18282/mcp/
 ```
 
 사전에 `python src/server.py`로 서버를 실행해 두어야 한다.

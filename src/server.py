@@ -34,6 +34,15 @@ DB_PATH = Path("D:/work/security/orchestrator.sqlite")
 DEFAULT_TIMEOUT_MS = 3000000
 DEFAULT_MCP_PORT = 18282
 DEFAULT_WEB_PORT = 18765
+MANUAL_ONLY_MARKER = "- - - - - -"
+CLAUDE_REVIEW_PROMPT_PREFIX = (
+    "Review mode.\n"
+    "You must read every referenced local file path before answering.\n"
+    "If any referenced file cannot be read, output exactly: BLOCKED|file-unreadable\n"
+    "Do not ask follow-up questions.\n"
+    "Do not guess.\n"
+    "Follow the user's requested output format exactly.\n\n"
+)
 
 # ---------------------------------------------------------------------------
 # Constants & types
@@ -90,6 +99,14 @@ def _truncate(text: str, limit: int = 2000) -> str:
     return f"{text[:limit]}\n...<truncated {len(text) - limit} chars>"
 
 
+def _is_manual_only_prompt(prompt: str) -> bool:
+    return MANUAL_ONLY_MARKER in prompt
+
+
+def _is_manual_only_cron(expr: str) -> bool:
+    return expr.strip() == MANUAL_ONLY_MARKER
+
+
 def _looks_like_file_review_failure(stdout: str) -> bool:
     lowered = (stdout or "").lower()
     patterns = (
@@ -117,6 +134,10 @@ def _log_tool_call(name: str, **arguments: Any) -> None:
 
 def _log_tool_result(name: str, result: Any) -> None:
     _log("tool.response", tool=name, result=_truncate(_safe_json(result)))
+
+
+def _json_response(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -307,15 +328,7 @@ def compile_claude_parts(messages: list[dict[str, Any]] | None) -> str:
 
 
 def build_claude_review_prompt(prompt: str) -> str:
-    prefix = (
-        "Review mode.\n"
-        "You must read every referenced local file path before answering.\n"
-        "If any referenced file cannot be read, output exactly: BLOCKED|file-unreadable\n"
-        "Do not ask follow-up questions.\n"
-        "Do not guess.\n"
-        "Follow the user's requested output format exactly.\n\n"
-    )
-    return f"{prefix}{prompt}".strip()
+    return f"{CLAUDE_REVIEW_PROMPT_PREFIX}{prompt}".strip()
 
 
 def compile_codex_prompt(messages: list[dict[str, Any]] | None) -> str:
@@ -543,6 +556,8 @@ def _parse_cron_field(field: str, minimum: int, maximum: int) -> set[int]:
             raise ValueError("cron field contains an empty segment")
         if "/" in part:
             base, step_raw = part.split("/", 1)
+            if not step_raw.strip():
+                raise ValueError(f"cron step value is missing in: {part!r}")
             step = int(step_raw)
             if step <= 0:
                 raise ValueError("cron step must be positive")
@@ -553,8 +568,12 @@ def _parse_cron_field(field: str, minimum: int, maximum: int) -> set[int]:
             start, end = minimum, maximum
         elif "-" in base:
             start_raw, end_raw = base.split("-", 1)
+            if not start_raw.strip() or not end_raw.strip():
+                raise ValueError(f"cron range is incomplete in: {part!r}")
             start, end = int(start_raw), int(end_raw)
         else:
+            if not base.strip():
+                raise ValueError(f"cron field value is empty in: {part!r}")
             start = end = int(base)
         if start < minimum or end > maximum or start > end:
             raise ValueError(f"cron value out of range: {part}")
@@ -574,6 +593,8 @@ def _parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[
 
 
 def _cron_matches(expr: str, candidate_utc: datetime) -> bool:
+    if _is_manual_only_cron(expr):
+        return False
     minute, hour, day, month, weekday = _parse_cron(expr)
     local = candidate_utc.astimezone()
     return (
@@ -585,7 +606,9 @@ def _cron_matches(expr: str, candidate_utc: datetime) -> bool:
     )
 
 
-def _next_cron_run(expr: str, after_utc: datetime | None = None) -> str:
+def _next_cron_run(expr: str, after_utc: datetime | None = None) -> str | None:
+    if _is_manual_only_cron(expr):
+        return None
     _parse_cron(expr)
     base = after_utc or datetime.now(timezone.utc)
     candidate = base.replace(second=0, microsecond=0)
@@ -861,12 +884,14 @@ class SessionStore:
     def _serialize_schedule(row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
+        prompt = row["prompt"]
         return {
             "id": row["id"],
             "name": row["name"],
             "agent": row["agent"],
             "cronExpr": row["cron_expr"],
-            "prompt": row["prompt"],
+            "prompt": prompt,
+            "manualOnly": _is_manual_only_prompt(str(prompt)),
             "skipPermissions": bool(row["skip_permissions"]),
             "enabled": bool(row["enabled"]),
             "running": bool(row["running"]),
@@ -906,7 +931,8 @@ class SessionStore:
             raise ValueError("name is required")
         if not prompt.strip():
             raise ValueError("prompt is required")
-        next_run_at = _next_cron_run(cron_expr)
+        is_manual = _is_manual_only_prompt(prompt) or cron_expr.strip() == MANUAL_ONLY_MARKER
+        next_run_at = None if is_manual else _next_cron_run(cron_expr)
         ts = _now_iso()
         job_id = str(uuid4())
         with self.lock:
@@ -970,17 +996,24 @@ class SessionStore:
             values["agent"] = agent
         if cron_expr is not None:
             values["cron_expr"] = cron_expr.strip()
-            values["next_run_at"] = _next_cron_run(cron_expr)
         if prompt is not None:
             if not prompt.strip():
                 raise ValueError("prompt is required")
             values["prompt"] = prompt
         if skip_permissions is not None:
             values["skip_permissions"] = 1 if skip_permissions else 0
+        effective_prompt = values.get("prompt", current["prompt"])
+        effective_cron = values.get("cron_expr", current["cronExpr"])
+        is_manual = (
+            _is_manual_only_prompt(str(effective_prompt))
+            or str(effective_cron).strip() == MANUAL_ONLY_MARKER
+        )
+        if cron_expr is not None:
+            values["next_run_at"] = None if is_manual else _next_cron_run(cron_expr)
         if enabled is not None:
             values["enabled"] = 1 if enabled else 0
             if enabled and "next_run_at" not in values:
-                values["next_run_at"] = _next_cron_run(str(current["cronExpr"]))
+                values["next_run_at"] = None if is_manual else _next_cron_run(str(current["cronExpr"]))
         if not values:
             return current
         values["updated_at"] = _now_iso()
@@ -1004,14 +1037,22 @@ class SessionStore:
 
     def list_due_schedule_ids(self, limit: int = 5) -> list[str]:
         now = _now_iso()
+        safe_limit = max(1, min(int(limit or 5), 50))
         with self.lock:
             rows = self.connection.execute(
-                "SELECT id FROM scheduled_jobs "
+                "SELECT id, prompt, cron_expr FROM scheduled_jobs "
                 "WHERE enabled = 1 AND running = 0 AND next_run_at <= ? "
                 "ORDER BY next_run_at ASC LIMIT ?",
-                (now, max(1, min(int(limit or 5), 50))),
+                (now, safe_limit * 3),
             ).fetchall()
-        return [str(row["id"]) for row in rows]
+        due_ids: list[str] = []
+        for row in rows:
+            if _is_manual_only_prompt(str(row["prompt"])) or _is_manual_only_cron(str(row["cron_expr"])):
+                continue
+            due_ids.append(str(row["id"]))
+            if len(due_ids) >= safe_limit:
+                break
+        return due_ids
 
     def list_schedule_runs(self, job_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         safe_limit = max(1, min(int(limit or 20), 100))
@@ -1028,12 +1069,15 @@ class SessionStore:
                 ).fetchall()
         return [self._serialize_schedule_run(row) for row in rows]
 
-    def run_schedule(self, job_id: str, *, force: bool = False) -> dict[str, Any]:
+    def _claim_schedule_run(self, job_id: str, *, force: bool = False) -> tuple[str, dict[str, Any]]:
+        """running=1 을 DB에 동기적으로 기록하고 (run_id, job) 을 반환한다."""
         job = self.get_schedule(job_id)
         if job is None:
             raise ValueError(f"schedule not found: {job_id}")
         if not job["enabled"] and not force:
             raise ValueError(f"schedule is disabled: {job_id}")
+        if job.get("manualOnly") and not force:
+            raise ValueError(f"schedule is manual-only: {job_id}")
         run_id = str(uuid4())
         started_at = _now_iso()
         with self.lock:
@@ -1049,7 +1093,10 @@ class SessionStore:
                 (run_id, job_id, "running", started_at),
             )
             self.connection.commit()
+        return run_id, job
 
+    def _execute_schedule_run(self, *, job_id: str, run_id: str, job: dict[str, Any]) -> dict[str, Any]:
+        """실제 에이전트 실행 및 결과 DB 저장. _claim_schedule_run 이후에 호출한다."""
         status = "failed"
         exit_code: int | None = None
         stdout = ""
@@ -1094,6 +1141,10 @@ class SessionStore:
                     (finished_at, next_run_at, finished_at, job_id),
                 )
                 self.connection.commit()
+
+    def run_schedule(self, job_id: str, *, force: bool = False) -> dict[str, Any]:
+        run_id, job = self._claim_schedule_run(job_id, force=force)
+        return self._execute_schedule_run(job_id=job_id, run_id=run_id, job=job)
 
     # -- agent execution -----------------------------------------------------
 
@@ -1345,6 +1396,17 @@ def _html_page(title: str, body: str) -> bytes:
     .modal {{ background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px; padding: 32px; width: 90%; max-width: 520px; max-height: 90vh; overflow-y: auto; }}
     .modal h2 {{ margin-bottom: 20px; }}
     .modal .btn-row {{ display: flex; gap: 12px; margin-top: 20px; }}
+    .toast-container {{ position: fixed; top: 20px; right: 20px; z-index: 2000; display: flex; flex-direction: column; gap: 10px; }}
+    .toast {{ min-width: 260px; max-width: 420px; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-primary); box-shadow: 0 10px 30px rgba(0,0,0,0.25); opacity: 0; transform: translateY(-8px); transition: opacity 0.18s ease, transform 0.18s ease; }}
+    .toast.show {{ opacity: 1; transform: translateY(0); }}
+    .toast.error {{ border-color: rgba(239,68,68,0.4); }}
+    .toast.success {{ border-color: rgba(16,185,129,0.35); }}
+    .btn[disabled] {{ opacity: 0.65; cursor: wait; }}
+
+    .loading-overlay {{ display: none; position: fixed; inset: 0; background: rgba(15,25,35,0.8); z-index: 3000; align-items: center; justify-content: center; flex-direction: column; gap: 16px; }}
+    .loading-overlay.active {{ display: flex; }}
+    .loading-spinner {{ width: 40px; height: 40px; border: 3px solid rgba(255,255,255,0.12); border-top-color: var(--accent-blue); border-radius: 50%; animation: spin 0.8s linear infinite; }}
+    @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
 
     @media (max-width: 900px) {{
       .stats {{ grid-template-columns: repeat(2, 1fr); }}
@@ -1354,6 +1416,13 @@ def _html_page(title: str, body: str) -> bytes:
 </head>
 <body>
 {body}
+
+<div class="loading-overlay" id="loadingOverlay">
+  <div class="loading-spinner"></div>
+  <div id="loadingText" style="color:var(--text-secondary);font-size:0.9rem;">처리 중...</div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
 
 <div class="modal-overlay" id="editModal">
   <div class="modal">
@@ -1404,9 +1473,70 @@ def _html_page(title: str, body: str) -> bytes:
 </div>
 
 <script>
+function showLoading(text) {{
+  document.getElementById('loadingText').textContent = text || '처리 중...';
+  document.getElementById('loadingOverlay').classList.add('active');
+}}
+function hideLoading() {{
+  document.getElementById('loadingOverlay').classList.remove('active');
+}}
+
+function showToast(message, kind = 'error', timeoutMs = 4000) {{
+  const container = document.getElementById('toastContainer');
+  const toast = document.createElement('div');
+  toast.className = 'toast ' + kind;
+  toast.textContent = message;
+  container.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('show'));
+  setTimeout(() => {{
+    toast.classList.remove('show');
+    setTimeout(() => toast.remove(), 180);
+  }}, timeoutMs);
+}}
+
+async function postFormAndReload(form, options = {{}}) {{
+  const submitter = options.submitter || form.querySelector('button[type="submit"]');
+  const submitterText = submitter ? submitter.textContent : '';
+  if (submitter) {{
+    submitter.disabled = true;
+    if (options.pendingText) submitter.textContent = options.pendingText;
+  }}
+  showLoading(options.loadingText || options.pendingText || '처리 중...');
+  try {{
+    const response = await fetch(form.action, {{
+      method: 'POST',
+      headers: {{
+        'X-Requested-With': 'fetch',
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      }},
+      body: new URLSearchParams(new FormData(form)).toString(),
+    }});
+    const payload = await response.json().catch(() => ({{ ok: false, error: '응답 파싱 실패' }}));
+    if (!response.ok || !payload.ok) {{
+      throw new Error(payload.error || '요청 실패');
+    }}
+    window.location.reload();
+  }} catch (error) {{
+    hideLoading();
+    if (submitter) {{
+      submitter.disabled = false;
+      submitter.textContent = submitterText;
+    }}
+    if (options.onError) {{
+      options.onError(error);
+    }} else {{
+      showToast(error instanceof Error ? error.message : String(error), 'error');
+    }}
+  }}
+}}
+
 function openEditModal(jobId) {{
   fetch('/api/schedule?jobId=' + encodeURIComponent(jobId))
-    .then(r => r.json())
+    .then(r => {{
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }})
     .then(job => {{
       document.getElementById('edit-jobId').value = job.id;
       document.getElementById('edit-name').value = job.name;
@@ -1420,6 +1550,9 @@ function openEditModal(jobId) {{
         document.getElementById('edit-agent-claude').checked = true;
       }}
       document.getElementById('editModal').classList.add('active');
+    }})
+    .catch(error => {{
+      showToast(error instanceof Error ? error.message : String(error), 'error');
     }});
 }}
 function closeEditModal() {{
@@ -1428,6 +1561,146 @@ function closeEditModal() {{
 document.getElementById('editModal').addEventListener('click', function(e) {{
   if (e.target === this) closeEditModal();
 }});
+
+const createForm = document.querySelector('form[action="/schedule/create"]');
+if (createForm) {{
+  createForm.addEventListener('submit', function(e) {{
+    e.preventDefault();
+    postFormAndReload(createForm, {{
+      submitter: createForm.querySelector('button[type="submit"]'),
+      pendingText: 'Creating...',
+      loadingText: '스케줄 생성 중...',
+      onError: (error) => showToast(error instanceof Error ? error.message : String(error), 'error'),
+    }});
+  }});
+}}
+
+const editForm = document.getElementById('editForm');
+if (editForm) {{
+  editForm.addEventListener('submit', function(e) {{
+    e.preventDefault();
+    postFormAndReload(editForm, {{
+      submitter: editForm.querySelector('button[type="submit"]'),
+      pendingText: 'Saving...',
+      loadingText: '저장 중...',
+    }});
+  }});
+}}
+
+document.querySelectorAll('form[action="/schedule/run"]').forEach(function(form) {{
+  form.addEventListener('submit', function(e) {{
+    e.preventDefault();
+    const btn = form.querySelector('button[type="submit"]');
+    if (btn && btn.disabled) return;
+    const jobItem = form.closest('[data-job-id]');
+    fetch(form.action, {{
+      method: 'POST',
+      headers: {{
+        'X-Requested-With': 'fetch',
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+      }},
+      body: new URLSearchParams(new FormData(form)).toString(),
+    }})
+      .then(function(r) {{ return r.json(); }})
+      .then(function(payload) {{
+        if (!payload.ok) {{ showToast(payload.error || '실행 실패', 'error'); return; }}
+        if (jobItem) {{
+          var badge = jobItem.querySelector('[data-status-badge]');
+          var runBtn = jobItem.querySelector('[data-run-btn]');
+          if (badge) {{ badge.className = 'status-badge running'; badge.textContent = 'running'; }}
+          if (runBtn) {{ runBtn.disabled = true; runBtn.style.opacity = '0.5'; runBtn.style.cursor = 'not-allowed'; }}
+        }}
+        if (window._startJobPolling) window._startJobPolling();
+      }})
+      .catch(function(err) {{ showToast(err.message || '네트워크 오류', 'error'); }});
+  }});
+}});
+
+document.querySelectorAll('form[action="/schedule/delete"]').forEach(function(form) {{
+  form.addEventListener('submit', function(e) {{
+    e.preventDefault();
+    if (!confirm('Delete this schedule?')) return;
+    postFormAndReload(form, {{
+      submitter: form.querySelector('button[type="submit"]'),
+      pendingText: 'Deleting...',
+      loadingText: '삭제 중...',
+    }});
+  }});
+}});
+
+document.querySelectorAll('form[action="/schedule/toggle"]').forEach(function(form) {{
+  form.addEventListener('submit', function(e) {{
+    e.preventDefault();
+    postFormAndReload(form, {{
+      submitter: form.querySelector('button[type="submit"]'),
+      loadingText: '상태 변경 중...',
+    }});
+  }});
+}});
+
+(function() {{
+  var _pollTimer = null;
+
+  function _updateJobStatus(job) {{
+    var item = document.querySelector('[data-job-id="' + job.id + '"]');
+    if (!item) return;
+    var badge = item.querySelector('[data-status-badge]');
+    var runBtn = item.querySelector('[data-run-btn]');
+    var status = job.running ? 'running' : (job.enabled ? 'enabled' : 'disabled');
+    if (badge) {{
+      badge.className = 'status-badge ' + status;
+      badge.textContent = status;
+    }}
+    if (runBtn) {{
+      runBtn.disabled = !!job.running;
+      runBtn.style.opacity = job.running ? '0.5' : '';
+      runBtn.style.cursor = job.running ? 'not-allowed' : '';
+    }}
+  }}
+
+  function _pollJobs() {{
+    fetch('/api/jobs')
+      .then(function(r) {{ return r.json(); }})
+      .then(function(data) {{
+        var runningCount = 0;
+        data.jobs.forEach(function(job) {{
+          _updateJobStatus(job);
+          if (job.running) runningCount++;
+        }});
+        var label = document.getElementById('runningLabel');
+        var subtitle = document.getElementById('dashboardSubtitle');
+        if (runningCount > 0) {{
+          if (!label && subtitle) {{
+            var span = document.createElement('span');
+            span.id = 'runningLabel';
+            span.style.color = 'var(--accent-orange)';
+            span.textContent = '실행 중 ' + runningCount + '개';
+            subtitle.appendChild(document.createTextNode(' — '));
+            subtitle.appendChild(span);
+          }} else if (label) {{
+            label.textContent = '실행 중 ' + runningCount + '개';
+          }}
+        }} else {{
+          if (label) {{ label.parentNode.removeChild(label.previousSibling); label.parentNode.removeChild(label); }}
+          clearInterval(_pollTimer);
+          _pollTimer = null;
+        }}
+      }})
+      .catch(function() {{}});
+  }}
+
+  function _startPolling() {{
+    if (_pollTimer) return;
+    _pollTimer = setInterval(_pollJobs, 4000);
+  }}
+
+  if (document.querySelector('[data-status-badge].running')) {{
+    _startPolling();
+  }}
+
+  window._startJobPolling = _startPolling;
+}})();
 </script>
 </body>
 </html>""".encode("utf-8")
@@ -1472,6 +1745,11 @@ class WebUiHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8") if length else ""
         return parse_qs(raw, keep_blank_values=True)
 
+    def _prefers_json(self) -> bool:
+        requested_with = self.headers.get("X-Requested-With", "")
+        accept = self.headers.get("Accept", "")
+        return requested_with.lower() == "fetch" or "application/json" in accept.lower()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/health":
@@ -1490,6 +1768,11 @@ class WebUiHandler(BaseHTTPRequestHandler):
                     self._send(HTTPStatus.OK, json.dumps(job, ensure_ascii=False), "application/json; charset=utf-8")
                     return
             self._send(HTTPStatus.NOT_FOUND, json.dumps({"error": "not found"}), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/api/jobs":
+            jobs = self.store.list_schedules(include_disabled=True)
+            slim = [{"id": j["id"], "running": j["running"], "enabled": j["enabled"]} for j in jobs]
+            self._send(HTTPStatus.OK, json.dumps({"jobs": slim}, ensure_ascii=False), "application/json; charset=utf-8")
             return
         self._render_index()
 
@@ -1524,13 +1807,30 @@ class WebUiHandler(BaseHTTPRequestHandler):
                     enabled=_form_bool(form, "enabled", False),
                 )
             elif parsed.path == "/schedule/run":
-                self.store.run_schedule(form.get("jobId", [""])[0], force=True)
+                job_id = form.get("jobId", [""])[0]
+                run_id, job = self.store._claim_schedule_run(job_id, force=True)
+                threading.Thread(
+                    target=self.store._execute_schedule_run,
+                    kwargs={"job_id": job_id, "run_id": run_id, "job": job},
+                    name=f"orch-manual-run-{job_id[:8]}",
+                    daemon=True,
+                ).start()
             else:
                 self._send(HTTPStatus.NOT_FOUND, _html_page("Not found", "<h1>Not found</h1>"))
                 return
-            self._redirect("/")
+            if self._prefers_json():
+                self._send(HTTPStatus.OK, _json_response({"ok": True}), "application/json; charset=utf-8")
+            else:
+                self._redirect("/")
         except Exception as exc:
-            self._send(HTTPStatus.BAD_REQUEST, _html_page("Error", f"<h1>요청 실패</h1><p class='danger'>{html.escape(str(exc))}</p><p><a href='/'>돌아가기</a></p>"))
+            if self._prefers_json():
+                self._send(
+                    HTTPStatus.BAD_REQUEST,
+                    _json_response({"ok": False, "error": str(exc)}),
+                    "application/json; charset=utf-8",
+                )
+            else:
+                self._send(HTTPStatus.BAD_REQUEST, _html_page("Error", f"<h1>요청 실패</h1><p class='danger'>{html.escape(str(exc))}</p><p><a href='/'>돌아가기</a></p>"))
 
     def _render_index(self) -> None:
         jobs = self.store.list_schedules(include_disabled=True)
@@ -1538,6 +1838,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
 
         # 통계 계산
         active_count = sum(1 for j in jobs if j["enabled"])
+        running_count = sum(1 for j in jobs if j["running"])
         total_runs = len(runs)
         failed_runs = sum(1 for r in runs if r["status"] == "failed")
         agents_used = len(set(j["agent"] for j in jobs)) if jobs else 0
@@ -1565,23 +1866,25 @@ class WebUiHandler(BaseHTTPRequestHandler):
             toggle_label = "Pause" if job["enabled"] else "Enable"
             agent_class = html.escape(job["agent"])
             prompt_preview = _truncate(job["prompt"], 80)
+            cron_display = "수동 실행 전용" if _is_manual_only_cron(job["cronExpr"]) else html.escape(job["cronExpr"])
+            run_btn_disabled = ' disabled style="opacity:0.5;cursor:not-allowed;"' if job["running"] else ""
             schedule_items.append(f"""
-<li class="schedule-item">
+<li class="schedule-item" data-job-id="{html.escape(job['id'])}">
   <div style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;">
     <div class="schedule-meta">
       <span class="agent-badge {agent_class}">{html.escape(job['agent'])}</span>
     </div>
     <div class="schedule-info" style="min-width:0;flex:1;">
-      <div class="schedule-name">{html.escape(job['name'])} <span class="status-badge {status}">{status}</span></div>
-      <div class="schedule-cron">{html.escape(job['cronExpr'])}</div>
+      <div class="schedule-name">{html.escape(job['name'])} <span class="status-badge {status}" data-status-badge>{status}</span></div>
+      <div class="schedule-cron">{cron_display}</div>
       <div class="schedule-prompt">{html.escape(prompt_preview)}</div>
     </div>
   </div>
   <div class="schedule-actions">
-    <form method="post" action="/schedule/run"><input type="hidden" name="jobId" value="{html.escape(job['id'])}"><button class="btn btn-sm btn-green">Run Now</button></form>
+    <form method="post" action="/schedule/run"><input type="hidden" name="jobId" value="{html.escape(job['id'])}"><button class="btn btn-sm btn-green" data-run-btn{run_btn_disabled}>Run Now</button></form>
     <button class="btn btn-sm btn-primary" onclick="openEditModal('{html.escape(job['id'])}')">Edit</button>
     <form method="post" action="/schedule/toggle"><input type="hidden" name="jobId" value="{html.escape(job['id'])}"><input type="hidden" name="enabled" value="{toggle_value}"><button class="btn btn-sm {toggle_btn_class}">{toggle_label}</button></form>
-    <form method="post" action="/schedule/delete" onsubmit="return confirm('Delete this schedule?')"><input type="hidden" name="jobId" value="{html.escape(job['id'])}"><button class="btn btn-sm btn-red">Delete</button></form>
+    <form method="post" action="/schedule/delete"><input type="hidden" name="jobId" value="{html.escape(job['id'])}"><button class="btn btn-sm btn-red">Delete</button></form>
     <a href="/runs?jobId={html.escape(job['id'])}" class="btn btn-sm btn-ghost">Runs</a>
   </div>
 </li>""")
@@ -1590,7 +1893,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
 <div class="header">
   <div>
     <h1>MCP Orchestration</h1>
-    <span class="subtitle">스케줄 관리 대시보드</span>
+    <span class="subtitle" id="dashboardSubtitle">스케줄 관리 대시보드{f' — <span style="color:var(--accent-orange)" id="runningLabel">실행 중 {running_count}개</span>' if running_count > 0 else ''}</span>
   </div>
 </div>
 
@@ -1751,6 +2054,18 @@ def _get_store() -> SessionStore:
     return _store
 
 
+def _reset_stuck_running_jobs(connection: sqlite3.Connection) -> None:
+    """서버 재시작 시 이전 비정상 종료로 running=1이 남은 잡을 리셋한다."""
+    now = _now_iso()
+    connection.execute(
+        "UPDATE scheduled_runs SET status = 'failed', finished_at = ?, error = ? WHERE status = 'running'",
+        (now, "서버가 실행 중에 재시작되었습니다"),
+    )
+    connection.execute("UPDATE scheduled_jobs SET running = 0 WHERE running = 1")
+    connection.commit()
+    _log("startup.reset_stuck_jobs")
+
+
 def _initialize() -> None:
     """서버 시작 전에 DB, Scheduler, Web UI를 초기화한다."""
     global _connection, _store, _scheduler
@@ -1758,6 +2073,7 @@ def _initialize() -> None:
     db_path = _get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     _connection = connect_database(str(db_path))
+    _reset_stuck_running_jobs(_connection)
     _store = SessionStore(
         connection=_connection,
         db_path=str(db_path),
@@ -1799,11 +2115,7 @@ def _shutdown() -> None:
 
 @contextlib.asynccontextmanager
 async def server_lifespan(_: FastMCP) -> AsyncIterator[None]:
-    # 초기화는 main()에서 이미 수행했다. lifespan은 종료 처리만 담당한다.
-    try:
-        yield
-    finally:
-        _shutdown()
+    yield
 
 
 mcp = FastMCP(
