@@ -20,19 +20,22 @@ Python에서 `claude -p`와 `codex exec`를 호출하고, MCP Tool과 SQLite 세
 `src/server.py` 상단 Configuration 섹션에서 설정한다.
 
 ```python
-BASE_DIR = Path("/Users/soonyub.hwang/desk")  # CLI 실행 시 기본 작업 디렉터리
-DB_PATH = Path("/Users/soonyub.hwang/desk/data/orchestrator.sqlite")  # SQLite DB 경로
+BASE_DIR = Path("D:/work")  # CLI 실행 시 기본 작업 디렉터리
+DB_PATH = Path("D:/work/security/orchestrator.sqlite")  # SQLite DB 경로
 DEFAULT_TIMEOUT_MS = 3000000                   # CLI 실행 타임아웃(ms)
+DEFAULT_MCP_PORT = 18282                       # MCP 포트
+DEFAULT_WEB_PORT = 18765                       # Web UI 포트
 ```
 
 - `BASE_DIR`: `agent_run`에서 `cwd`를 지정하지 않았을 때 CLI가 실행될 디렉터리. 이 디렉터리의 `.mcp.json`, `CLAUDE.md`, skills가 CLI에 적용된다.
 - `DB_PATH`: SQLite 데이터베이스 파일 경로. DB 저장 위치는 Configuration 섹션에서 직접 수정한다.
 - `DEFAULT_TIMEOUT_MS`: CLI 실행 기본 타임아웃.
+- `D:/work/security`: `filePaths` 주입 경로에서 차단되는 보안 루트다.
 
 ## 실행 방법
 
 ```bash
-cd lsm-ai/tools/mcp-orchestration-ai
+cd D:/work/nowonbun-orchestration-ai-mcp
 python src/server.py
 ```
 
@@ -97,6 +100,13 @@ url = "http://127.0.0.1:18282/mcp/"
 - 역할은 `user`와 `assistant`만 사용 가능(`system`은 미지원)
 - `cwd` 미지정 시 `BASE_DIR`에서 실행된다
 
+### `agent_run` 입력 제약
+
+- `filePaths`의 상대경로는 `cwd`가 있으면 그 경로를 기준으로, 없으면 `BASE_DIR`을 기준으로 해석된다.
+- `filePaths`로 `D:/work/security` 하위 경로는 읽을 수 없다.
+- `extraArgs`에는 `--allowedTools`, `--allowed-tools`, `--dangerously-skip-permissions`, `--sandbox`, `--ask-for-approval`, `--add-dir`, `--dangerously-bypass-approvals-and-sandbox`를 넣을 수 없다.
+- `skipPermissions`는 `agent="claude"`일 때만 내부적으로 `--dangerously-skip-permissions`를 추가하며, 다른 agent에서는 전달해도 효과가 없다.
+
 ## 파일 구성
 
 ```text
@@ -105,16 +115,16 @@ mcp-orchestration-ai/
 ├── PLANNING.md          # 상세 설계 문서
 ├── SKILL.md             # AI용 사용 스킬 정의
 ├── .gitignore
-├── data/
-│   └── orchestrator.sqlite  # SQLite DB(자동 생성, .gitignore 대상)
 └── src/
     └── server.py            # 구현 본체(단일 파일 구성)
 ```
 
+- SQLite DB 기본 위치는 저장소 내부가 아니라 `D:/work/security/orchestrator.sqlite`다.
+
 ## 테스트
 
 ```bash
-cd lsm-ai/tools/mcp-orchestration-ai
+cd D:/work/nowonbun-orchestration-ai-mcp
 python3 -m py_compile src/server.py
 ```
 

@@ -37,6 +37,9 @@ DEFAULT_MCP_PORT = 18282
 DEFAULT_WEB_PORT = 18765
 DEFAULT_GRACEFUL_SHUTDOWN_SEC = 5
 MANUAL_ONLY_MARKER = "- - - - - -"
+SECURITY_DENY_ROOTS: tuple[Path, ...] = (
+    (BASE_DIR / "security").resolve(),
+)
 CLAUDE_REVIEW_PROMPT_PREFIX = (
     "Review mode.\n"
     "You must read every referenced local file path before answering.\n"
@@ -58,6 +61,10 @@ _BLOCKED_EXTRA_ARGS: frozenset[str] = frozenset({
     "-p", "--print",
     "--allowedTools", "--allowed-tools",
     "--dangerously-skip-permissions",
+    "-s", "--sandbox",
+    "-a", "--ask-for-approval",
+    "--add-dir",
+    "--dangerously-bypass-approvals-and-sandbox",
 })
 
 # ---------------------------------------------------------------------------
@@ -411,19 +418,36 @@ def _normalize_injected_file_paths(file_paths: list[str] | None) -> list[str]:
     return normalized
 
 
-def _read_files_for_prompt(file_paths: list[str], *, char_limit_per_file: int = 12000) -> str:
+def _is_denied_path(path: Path) -> bool:
+    for denied_root in SECURITY_DENY_ROOTS:
+        try:
+            path.relative_to(denied_root)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _resolve_injected_file_path(raw_path: str, *, base_dir: Path) -> Path:
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    return candidate.resolve()
+
+
+def _read_files_for_prompt(
+    file_paths: list[str],
+    *,
+    base_dir: Path,
+    char_limit_per_file: int = 12000,
+) -> str:
     if not file_paths:
         return ""
 
     sections: list[str] = []
-    security_root = Path("D:/work/security").resolve()
     for raw_path in file_paths:
-        resolved = Path(raw_path).resolve()
-        try:
-            resolved.relative_to(security_root)
-        except ValueError:
-            pass
-        else:
+        resolved = _resolve_injected_file_path(raw_path, base_dir=base_dir)
+        if _is_denied_path(resolved):
             raise ValueError("\ubcf4\uc548 \uc815\ucc45\uc5d0 \uc758\ud574 \uc811\uadfc\uc774 \uac70\ubd80\ub418\uc5c8\uc2b5\ub2c8\ub2e4")
         if not resolved.exists():
             raise ValueError(f"filePaths target not found: {resolved}")
@@ -705,6 +729,8 @@ class SessionStore:
         self.db_path = db_path
         self.default_timeout_ms = default_timeout_ms
         self.lock = threading.RLock()
+        self.active_run_lock = threading.Condition(threading.RLock())
+        self.active_run_count = 0
 
     # -- serialization -------------------------------------------------------
 
@@ -1097,8 +1123,74 @@ class SessionStore:
             self.connection.commit()
         return run_id, job
 
+    def _begin_schedule_execution(self) -> None:
+        with self.active_run_lock:
+            self.active_run_count += 1
+
+    def _end_schedule_execution(self) -> None:
+        with self.active_run_lock:
+            self.active_run_count = max(0, self.active_run_count - 1)
+            self.active_run_lock.notify_all()
+
+    def wait_for_schedule_executions(self, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        with self.active_run_lock:
+            while self.active_run_count > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.active_run_lock.wait(timeout=remaining)
+            return True
+
+    def _finalize_schedule_run(
+        self,
+        *,
+        job_id: str,
+        run_id: str,
+        status: str,
+        exit_code: int | None,
+        stdout: str,
+        stderr: str,
+        finished_at: str,
+        error: str | None,
+        next_run_at: str | None,
+    ) -> None:
+        try:
+            with self.lock:
+                self.connection.execute(
+                    "UPDATE scheduled_runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, "
+                    "finished_at = ?, error = ? WHERE id = ?",
+                    (status, exit_code, stdout, stderr, finished_at, error, run_id),
+                )
+                self.connection.execute(
+                    "UPDATE scheduled_jobs SET running = 0, last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
+                    (finished_at, next_run_at, finished_at, job_id),
+                )
+                self.connection.commit()
+            return
+        except sqlite3.ProgrammingError as exc:
+            if "closed database" not in str(exc):
+                raise
+            _log("schedule.finalize_reopen", job_id=job_id, run_id=run_id, error=str(exc))
+
+        fallback = sqlite3.connect(self.db_path)
+        try:
+            fallback.execute(
+                "UPDATE scheduled_runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, "
+                "finished_at = ?, error = ? WHERE id = ?",
+                (status, exit_code, stdout, stderr, finished_at, error, run_id),
+            )
+            fallback.execute(
+                "UPDATE scheduled_jobs SET running = 0, last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
+                (finished_at, next_run_at, finished_at, job_id),
+            )
+            fallback.commit()
+        finally:
+            fallback.close()
+
     def _execute_schedule_run(self, *, job_id: str, run_id: str, job: dict[str, Any]) -> dict[str, Any]:
         """실제 에이전트 실행 및 결과 DB 저장. _claim_schedule_run 이후에 호출한다."""
+        self._begin_schedule_execution()
         status = "failed"
         exit_code: int | None = None
         stdout = ""
@@ -1132,17 +1224,22 @@ class SessionStore:
                 next_run_at = None
                 error = error or str(exc)
                 status = "failed"
-            with self.lock:
-                self.connection.execute(
-                    "UPDATE scheduled_runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, "
-                    "finished_at = ?, error = ? WHERE id = ?",
-                    (status, exit_code, stdout, stderr, finished_at, error, run_id),
+            try:
+                self._finalize_schedule_run(
+                    job_id=job_id,
+                    run_id=run_id,
+                    status=status,
+                    exit_code=exit_code,
+                    stdout=stdout,
+                    stderr=stderr,
+                    finished_at=finished_at,
+                    error=error,
+                    next_run_at=next_run_at,
                 )
-                self.connection.execute(
-                    "UPDATE scheduled_jobs SET running = 0, last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
-                    (finished_at, next_run_at, finished_at, job_id),
-                )
-                self.connection.commit()
+            except Exception as exc:
+                _log("schedule.finalize_failed", job_id=job_id, run_id=run_id, error=str(exc))
+            finally:
+                self._end_schedule_execution()
 
     def run_schedule(self, job_id: str, *, force: bool = False) -> dict[str, Any]:
         run_id, job = self._claim_schedule_run(job_id, force=force)
@@ -1177,17 +1274,17 @@ class SessionStore:
         self.append_messages(active_session_id, current_messages, agent=agent, is_session=use_session)
 
         request_messages = self._get_request_messages(active_session_id, current_messages, use_session)
+        resolved_cwd = str(Path(cwd).resolve()) if cwd else str(_get_base_dir())
 
         if agent == "claude":
             compiled_prompt = compile_claude_parts(request_messages)
             if injected_file_paths:
-                injected_files = _read_files_for_prompt(injected_file_paths)
+                injected_files = _read_files_for_prompt(injected_file_paths, base_dir=Path(resolved_cwd))
                 compiled_prompt = f"{compiled_prompt}\n\n[INJECTED FILE CONTENTS]\n{injected_files}".strip()
                 compiled_prompt = build_claude_review_prompt(compiled_prompt)
         else:
             compiled_prompt = compile_codex_prompt(request_messages)
 
-        resolved_cwd = str(Path(cwd).resolve()) if cwd else str(_get_base_dir())
         _log(
             "agent.compiled_prompt",
             agent=agent,
@@ -2101,15 +2198,19 @@ def _get_store() -> SessionStore:
     return _store
 
 
-def _reset_stuck_running_jobs(connection: sqlite3.Connection) -> None:
-    """서버 재시작 시 이전 비정상 종료로 running=1이 남은 잡을 리셋한다."""
+def _mark_running_interrupted(connection: sqlite3.Connection, *, reason: str) -> None:
     now = _now_iso()
     connection.execute(
         "UPDATE scheduled_runs SET status = 'failed', finished_at = ?, error = ? WHERE status = 'running'",
-        (now, "서버가 실행 중에 재시작되었습니다"),
+        (now, reason),
     )
     connection.execute("UPDATE scheduled_jobs SET running = 0 WHERE running = 1")
     connection.commit()
+
+
+def _reset_stuck_running_jobs(connection: sqlite3.Connection) -> None:
+    """서버 재시작 시 이전 비정상 종료로 running=1이 남은 잡을 리셋한다."""
+    _mark_running_interrupted(connection, reason="서버가 실행 중에 재시작되었습니다")
     _log("startup.reset_stuck_jobs")
 
 
@@ -2154,7 +2255,14 @@ def _shutdown() -> None:
     if _scheduler is not None:
         _scheduler.stop()
         _scheduler = None
+    if _store is not None:
+        grace_seconds = float(os.getenv("ORCH_SCHEDULE_SHUTDOWN_GRACE_SEC", "5"))
+        completed = _store.wait_for_schedule_executions(grace_seconds)
+        if not completed:
+            _log("shutdown.active_schedule_runs_interrupted", grace_seconds=grace_seconds)
     if _connection is not None:
+        with contextlib.suppress(Exception):
+            _mark_running_interrupted(_connection, reason="서버 종료로 실행이 중단되었습니다")
         _connection.close()
     _connection = None
     _store = None
@@ -2360,7 +2468,9 @@ def agent_run(
         timeoutMs=timeoutMs,
         skipPermissions=skipPermissions,
     )
-    resolved_extra: list[str] = list(extraArgs or [])
+    user_extra_args: list[str] = list(extraArgs or [])
+    _validate_extra_args(user_extra_args)
+    resolved_extra: list[str] = list(user_extra_args)
     if skipPermissions and agent == "claude":
         resolved_extra.append("--dangerously-skip-permissions")
     result = _get_store().run_agent(
