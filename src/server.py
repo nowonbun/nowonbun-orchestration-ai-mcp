@@ -32,6 +32,8 @@ from mcp.server.fastmcp import FastMCP
 BASE_DIR = Path("D:/work")
 DB_PATH = Path("D:/work/security/orchestrator.sqlite")
 DEFAULT_TIMEOUT_MS = 3000000
+DEFAULT_MCP_PORT = 18282
+DEFAULT_WEB_PORT = 18765
 
 # ---------------------------------------------------------------------------
 # Constants & types
@@ -1698,7 +1700,7 @@ def _start_web_ui() -> None:
         _log("web.disabled")
         return
     host = os.getenv("ORCH_WEB_HOST", "127.0.0.1")
-    port = int(os.getenv("ORCH_WEB_PORT", "18765"))
+    port = int(os.getenv("ORCH_WEB_PORT", str(DEFAULT_WEB_PORT)))
     try:
         _web_server = ThreadingHTTPServer((host, port), WebUiHandler)
         _web_thread = threading.Thread(target=_web_server.serve_forever, name="orch-web-ui", daemon=True)
@@ -1772,10 +1774,10 @@ def _initialize() -> None:
         db_path=str(db_path),
         transport=_get_transport(),
         host=os.getenv("ORCH_HOST", os.getenv("ORCH_SSE_HOST", "127.0.0.1")),
-        port=int(os.getenv("ORCH_PORT", os.getenv("ORCH_SSE_PORT", "18282"))),
+        port=int(os.getenv("ORCH_PORT", os.getenv("ORCH_SSE_PORT", str(DEFAULT_MCP_PORT)))),
         web_enabled=_env_flag("ORCH_WEB_ENABLED", True),
         web_host=os.getenv("ORCH_WEB_HOST", "127.0.0.1"),
-        web_port=int(os.getenv("ORCH_WEB_PORT", "18765")),
+        web_port=int(os.getenv("ORCH_WEB_PORT", str(DEFAULT_WEB_PORT))),
         debug=_env_flag("ORCH_DEBUG", True),
         log_level=os.getenv("ORCH_LOG_LEVEL", "DEBUG"),
     )
@@ -1808,7 +1810,7 @@ mcp = FastMCP(
     name="nowonbun-orchestration-ai-mcp",
     instructions="Claude/Codex CLI orchestration MCP server",
     host=os.getenv("ORCH_HOST", os.getenv("ORCH_SSE_HOST", "127.0.0.1")),
-    port=int(os.getenv("ORCH_PORT", os.getenv("ORCH_SSE_PORT", "18282"))),
+    port=int(os.getenv("ORCH_PORT", os.getenv("ORCH_SSE_PORT", str(DEFAULT_MCP_PORT)))),
     json_response=True,
     debug=_env_flag("ORCH_DEBUG", True),
     log_level=os.getenv("ORCH_LOG_LEVEL", "DEBUG"),
