@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import html
 import json
 import os
 import shutil
@@ -11,26 +12,37 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 
 
 # ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+#BASE_DIR = Path("/Users/soonyub.hwang/Works/github/lsm")
+BASE_DIR = Path("/Users/soonyub.hwang/desk")
+DEFAULT_TIMEOUT_MS = 3000000
+
+# ---------------------------------------------------------------------------
 # Constants & types
 # ---------------------------------------------------------------------------
 
-ALLOWED_ROLES = {"system", "user", "assistant", "tool"}
+ALLOWED_ROLES = {"user", "assistant", "tool"}
 Agent = Literal["claude", "codex"]
-Transport = Literal["stdio", "sse", "streamable-http"]
+Transport = Literal["streamable-http"]
 
 _BLOCKED_EXTRA_ARGS: frozenset[str] = frozenset({
     "-p", "--print",
-    "--system",
     "--allowedTools", "--allowed-tools",
     "--dangerously-skip-permissions",
 })
@@ -41,6 +53,9 @@ _BLOCKED_EXTRA_ARGS: frozenset[str] = frozenset({
 
 _connection: sqlite3.Connection | None = None
 _store: "SessionStore | None" = None
+_scheduler: "ScheduleRunner | None" = None
+_web_server: ThreadingHTTPServer | None = None
+_web_thread: threading.Thread | None = None
 _shutdown_timer: threading.Timer | None = None
 _shutdown_signal_count = 0
 
@@ -116,11 +131,14 @@ def _install_asyncio_exception_filter(loop: asyncio.AbstractEventLoop) -> None:
     loop.set_exception_handler(handler)
 
 
-class _WindowsFilteredEventLoopPolicy(asyncio.WindowsProactorEventLoopPolicy):  # type: ignore[attr-defined]
-    def new_event_loop(self) -> asyncio.AbstractEventLoop:
-        loop = super().new_event_loop()
-        _install_asyncio_exception_filter(loop)
-        return loop
+if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+    class _WindowsFilteredEventLoopPolicy(asyncio.WindowsProactorEventLoopPolicy):  # type: ignore[attr-defined]
+        def new_event_loop(self) -> asyncio.AbstractEventLoop:
+            loop = super().new_event_loop()
+            _install_asyncio_exception_filter(loop)
+            return loop
+else:
+    _WindowsFilteredEventLoopPolicy = None  # type: ignore[assignment]
 
 
 def _force_exit(exit_code: int = 130) -> None:
@@ -236,15 +254,13 @@ def normalize_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, 
 
 def _split_messages(
     normalized: list[dict[str, str]],
-) -> tuple[list[str], list[dict[str, str]], str]:
-    """(system_contents, prior_conversation, last_user_content) 로 분해한다."""
-    system_contents = [m["content"] for m in normalized if m["role"] == "system"]
-    conversation = [m for m in normalized if m["role"] != "system"]
+) -> tuple[list[dict[str, str]], str]:
+    """(prior_conversation, last_user_content)로 분해한다."""
     last_user = next(
-        (m["content"] for m in reversed(conversation) if m["role"] == "user"),
+        (m["content"] for m in reversed(normalized) if m["role"] == "user"),
         normalized[-1]["content"],
     )
-    return system_contents, conversation[:-1], last_user
+    return normalized[:-1], last_user
 
 
 def _format_prior(prior: list[dict[str, str]], labels: dict[str, str]) -> list[str]:
@@ -256,32 +272,20 @@ def _format_prior(prior: list[dict[str, str]], labels: dict[str, str]) -> list[s
     return lines
 
 
-def compile_claude_parts(messages: list[dict[str, Any]] | None) -> tuple[str | None, str]:
-    """claude CLI용 (--system 값, -p 값) 쌍을 반환한다."""
+def compile_claude_parts(messages: list[dict[str, Any]] | None) -> str:
+    """claude CLI용 -p 값을 반환한다."""
     normalized = normalize_messages(messages)
     if not normalized:
-        return None, "사용자 질문에 직접 답하세요."
+        return ""
 
-    system_contents, prior, last_user = _split_messages(normalized)
-
-    system_parts: list[str] = []
-    if system_contents:
-        system_parts.append("지시사항:")
-        system_parts.extend(f"- {c}" for c in system_contents)
-        system_parts.append("")
-    system_parts.extend([
-        "답변 규칙:",
-        "- 사용자 질문에 직접 답하세요.",
-        "- 인사, 안내, 재질문을 하지 마세요.",
-        "- 설명 없이 최종 답변만 출력하세요.",
-    ])
+    prior, last_user = _split_messages(normalized)
 
     user_parts = _format_prior(prior, {"user": "[이전 질문]", "assistant": "[이전 답변]", "tool": "[도구 결과]"})
     if user_parts:
         user_parts.append("")
     user_parts.append(last_user)
 
-    return "\n".join(system_parts).strip() or None, "\n".join(user_parts).strip()
+    return "\n".join(user_parts).strip()
 
 
 def compile_codex_prompt(messages: list[dict[str, Any]] | None) -> str:
@@ -290,13 +294,9 @@ def compile_codex_prompt(messages: list[dict[str, Any]] | None) -> str:
     if not normalized:
         return ""
 
-    system_contents, prior, last_user = _split_messages(normalized)
+    prior, last_user = _split_messages(normalized)
 
     parts: list[str] = []
-    if system_contents:
-        parts.extend(system_contents)
-        parts.append("")
-
     prior_lines = _format_prior(prior, {"user": "이전 요청:", "assistant": "이전 응답:", "tool": "도구 결과:"})
     if prior_lines:
         parts.extend(prior_lines)
@@ -341,16 +341,16 @@ def _validate_extra_args(args: list[str]) -> None:
 def _build_command(
     agent: str,
     prompt: str,
-    system_prompt: str | None,
     allowed_tools_pattern: str | None,
     extra_args: list[str],
+    *,
+    _internal: bool = False,
 ) -> list[str]:
-    _validate_extra_args(extra_args)
+    if not _internal:
+        _validate_extra_args(extra_args)
 
     if agent == "claude":
         command = [_resolve_cli_command("claude"), "-p", prompt]
-        if system_prompt:
-            command.extend(["--system", system_prompt])
         if allowed_tools_pattern:
             command.extend(["--allowedTools", allowed_tools_pattern])
         command.extend(extra_args)
@@ -368,13 +368,13 @@ def run_agent_cli(
     *,
     agent: str,
     prompt: str,
-    system_prompt: str | None = None,
     cwd: str | None,
     timeout_ms: int,
     allowed_tools_pattern: str | None,
     extra_args: list[str],
+    _internal: bool = False,
 ) -> dict[str, Any]:
-    command = _build_command(agent, prompt, system_prompt, allowed_tools_pattern, extra_args)
+    command = _build_command(agent, prompt, allowed_tools_pattern, extra_args, _internal=_internal)
     working_directory = str(Path(cwd).resolve()) if cwd else None
     _log("cli.start", agent=agent, cwd=working_directory, timeout_ms=timeout_ms,
          allowed_tools_pattern=allowed_tools_pattern)
@@ -436,6 +436,86 @@ def run_agent_cli(
     return result
 
 
+
+
+# ---------------------------------------------------------------------------
+# Cron schedule helpers
+# ---------------------------------------------------------------------------
+
+_CRON_FIELD_RANGES: tuple[tuple[int, int], ...] = (
+    (0, 59),   # 분
+    (0, 23),   # 시
+    (1, 31),   # 일
+    (1, 12),   # 월
+    (0, 6),    # 요일(월요일=0)
+)
+
+
+def _parse_cron_field(field: str, minimum: int, maximum: int) -> set[int]:
+    values: set[int] = set()
+    for part in field.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError("cron field contains an empty segment")
+        if "/" in part:
+            base, step_raw = part.split("/", 1)
+            step = int(step_raw)
+            if step <= 0:
+                raise ValueError("cron step must be positive")
+        else:
+            base = part
+            step = 1
+        if base == "*":
+            start, end = minimum, maximum
+        elif "-" in base:
+            start_raw, end_raw = base.split("-", 1)
+            start, end = int(start_raw), int(end_raw)
+        else:
+            start = end = int(base)
+        if start < minimum or end > maximum or start > end:
+            raise ValueError(f"cron value out of range: {part}")
+        values.update(range(start, end + 1, step))
+    return values
+
+
+def _parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[int]]:
+    fields = expr.strip().split()
+    if len(fields) != 5:
+        raise ValueError("cron expression must have 5 fields")
+    parsed = tuple(
+        _parse_cron_field(field, minimum, maximum)
+        for field, (minimum, maximum) in zip(fields, _CRON_FIELD_RANGES, strict=True)
+    )
+    return parsed  # type: ignore[return-value]
+
+
+def _cron_matches(expr: str, candidate_utc: datetime) -> bool:
+    minute, hour, day, month, weekday = _parse_cron(expr)
+    local = candidate_utc.astimezone()
+    return (
+        local.minute in minute
+        and local.hour in hour
+        and local.day in day
+        and local.month in month
+        and local.weekday() in weekday
+    )
+
+
+def _next_cron_run(expr: str, after_utc: datetime | None = None) -> str:
+    _parse_cron(expr)
+    base = after_utc or datetime.now(timezone.utc)
+    candidate = base.replace(second=0, microsecond=0)
+    if candidate <= base:
+        candidate = candidate.replace(minute=candidate.minute) + _MINUTE
+    for _ in range(366 * 24 * 60):
+        if _cron_matches(expr, candidate):
+            return candidate.isoformat()
+        candidate += _MINUTE
+    raise ValueError("cron expression has no run within one year")
+
+
+_MINUTE = timedelta(minutes=1)
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -470,8 +550,38 @@ def initialize_database(connection: sqlite3.Connection) -> None:
           FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS scheduled_jobs (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          agent TEXT NOT NULL,
+          cron_expr TEXT NOT NULL,
+          prompt TEXT NOT NULL,
+          skip_permissions INTEGER NOT NULL DEFAULT 0,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          running INTEGER NOT NULL DEFAULT 0,
+          last_run_at TEXT,
+          next_run_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS scheduled_runs (
+          id TEXT PRIMARY KEY,
+          job_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          exit_code INTEGER,
+          stdout TEXT,
+          stderr TEXT,
+          started_at TEXT NOT NULL,
+          finished_at TEXT,
+          error TEXT,
+          FOREIGN KEY(job_id) REFERENCES scheduled_jobs(id) ON DELETE CASCADE
+        );
+
         CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_session_id_sort_order ON messages(session_id, sort_order);
+        CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due ON scheduled_jobs(enabled, running, next_run_at);
+        CREATE INDEX IF NOT EXISTS idx_scheduled_runs_job_started ON scheduled_runs(job_id, started_at DESC);
     """)
     connection.commit()
 
@@ -538,22 +648,9 @@ class SessionStore:
     def _build_current_messages(
         self,
         prompt: str,
-        system_prompt: str | None,
         supplemental: list[dict[str, str]],
-        session_id: str,
-        use_session: bool,
     ) -> list[dict[str, str]]:
         current: list[dict[str, str]] = []
-        if system_prompt:
-            should_add = True
-            if use_session:
-                existing = (self.get_session(session_id) or {}).get("messages", [])
-                should_add = not any(
-                    m["role"] == "system" and m["content"] == system_prompt and m.get("isSession")
-                    for m in existing
-                )
-            if should_add:
-                current.append({"role": "system", "content": system_prompt})
         current.extend(supplemental)
         current.append({"role": "user", "content": prompt})
         return current
@@ -674,6 +771,246 @@ class SessionStore:
             "defaultTimeoutMs": self.default_timeout_ms,
         }
 
+    # -- schedule API --------------------------------------------------------
+
+    @staticmethod
+    def _serialize_schedule(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "agent": row["agent"],
+            "cronExpr": row["cron_expr"],
+            "prompt": row["prompt"],
+            "skipPermissions": bool(row["skip_permissions"]),
+            "enabled": bool(row["enabled"]),
+            "running": bool(row["running"]),
+            "lastRunAt": row["last_run_at"],
+            "nextRunAt": row["next_run_at"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+
+    @staticmethod
+    def _serialize_schedule_run(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "jobId": row["job_id"],
+            "status": row["status"],
+            "exitCode": row["exit_code"],
+            "stdout": row["stdout"],
+            "stderr": row["stderr"],
+            "startedAt": row["started_at"],
+            "finishedAt": row["finished_at"],
+            "error": row["error"],
+        }
+
+    def create_schedule(
+        self,
+        *,
+        name: str,
+        agent: str,
+        cron_expr: str,
+        prompt: str,
+        skip_permissions: bool = False,
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        if agent not in {"claude", "codex"}:
+            raise ValueError("agent must be claude or codex")
+        if not name.strip():
+            raise ValueError("name is required")
+        if not prompt.strip():
+            raise ValueError("prompt is required")
+        next_run_at = _next_cron_run(cron_expr)
+        ts = _now_iso()
+        job_id = str(uuid4())
+        with self.lock:
+            self.connection.execute(
+                "INSERT INTO scheduled_jobs "
+                "(id, name, agent, cron_expr, prompt, skip_permissions, enabled, running, next_run_at, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                (
+                    job_id,
+                    name.strip(),
+                    agent,
+                    cron_expr.strip(),
+                    prompt,
+                    1 if skip_permissions else 0,
+                    1 if enabled else 0,
+                    next_run_at,
+                    ts,
+                    ts,
+                ),
+            )
+            self.connection.commit()
+        return self.get_schedule(job_id) or {"id": job_id}
+
+    def get_schedule(self, job_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT * FROM scheduled_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._serialize_schedule(row)
+
+    def list_schedules(self, include_disabled: bool = True) -> list[dict[str, Any]]:
+        where = "" if include_disabled else "WHERE enabled = 1"
+        with self.lock:
+            rows = self.connection.execute(
+                f"SELECT * FROM scheduled_jobs {where} ORDER BY enabled DESC, next_run_at ASC, created_at DESC"
+            ).fetchall()
+        return [self._serialize_schedule(row) for row in rows if row is not None]
+
+    def update_schedule(
+        self,
+        *,
+        job_id: str,
+        name: str | None = None,
+        agent: str | None = None,
+        cron_expr: str | None = None,
+        prompt: str | None = None,
+        skip_permissions: bool | None = None,
+        enabled: bool | None = None,
+    ) -> dict[str, Any]:
+        current = self.get_schedule(job_id)
+        if current is None:
+            raise ValueError(f"schedule not found: {job_id}")
+        values: dict[str, Any] = {}
+        if name is not None:
+            if not name.strip():
+                raise ValueError("name is required")
+            values["name"] = name.strip()
+        if agent is not None:
+            if agent not in {"claude", "codex"}:
+                raise ValueError("agent must be claude or codex")
+            values["agent"] = agent
+        if cron_expr is not None:
+            values["cron_expr"] = cron_expr.strip()
+            values["next_run_at"] = _next_cron_run(cron_expr)
+        if prompt is not None:
+            if not prompt.strip():
+                raise ValueError("prompt is required")
+            values["prompt"] = prompt
+        if skip_permissions is not None:
+            values["skip_permissions"] = 1 if skip_permissions else 0
+        if enabled is not None:
+            values["enabled"] = 1 if enabled else 0
+            if enabled and "next_run_at" not in values:
+                values["next_run_at"] = _next_cron_run(str(current["cronExpr"]))
+        if not values:
+            return current
+        values["updated_at"] = _now_iso()
+        assignments = ", ".join(f"{column} = ?" for column in values)
+        with self.lock:
+            self.connection.execute(
+                f"UPDATE scheduled_jobs SET {assignments} WHERE id = ?",
+                (*values.values(), job_id),
+            )
+            self.connection.commit()
+        return self.get_schedule(job_id) or {"id": job_id}
+
+    def delete_schedule(self, job_id: str) -> dict[str, Any]:
+        with self.lock:
+            row = self.connection.execute("SELECT id FROM scheduled_jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                return {"deleted": False, "jobId": job_id}
+            self.connection.execute("DELETE FROM scheduled_jobs WHERE id = ?", (job_id,))
+            self.connection.commit()
+        return {"deleted": True, "jobId": job_id}
+
+    def list_due_schedule_ids(self, limit: int = 5) -> list[str]:
+        now = _now_iso()
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT id FROM scheduled_jobs "
+                "WHERE enabled = 1 AND running = 0 AND next_run_at <= ? "
+                "ORDER BY next_run_at ASC LIMIT ?",
+                (now, max(1, min(int(limit or 5), 50))),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def list_schedule_runs(self, job_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 20), 100))
+        with self.lock:
+            if job_id:
+                rows = self.connection.execute(
+                    "SELECT * FROM scheduled_runs WHERE job_id = ? ORDER BY started_at DESC LIMIT ?",
+                    (job_id, safe_limit),
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    "SELECT * FROM scheduled_runs ORDER BY started_at DESC LIMIT ?",
+                    (safe_limit,),
+                ).fetchall()
+        return [self._serialize_schedule_run(row) for row in rows]
+
+    def run_schedule(self, job_id: str, *, force: bool = False) -> dict[str, Any]:
+        job = self.get_schedule(job_id)
+        if job is None:
+            raise ValueError(f"schedule not found: {job_id}")
+        if not job["enabled"] and not force:
+            raise ValueError(f"schedule is disabled: {job_id}")
+        run_id = str(uuid4())
+        started_at = _now_iso()
+        with self.lock:
+            updated = self.connection.execute(
+                "UPDATE scheduled_jobs SET running = 1, updated_at = ? WHERE id = ? AND running = 0",
+                (started_at, job_id),
+            ).rowcount
+            if updated != 1:
+                self.connection.rollback()
+                raise RuntimeError(f"schedule is already running: {job_id}")
+            self.connection.execute(
+                "INSERT INTO scheduled_runs (id, job_id, status, started_at) VALUES (?, ?, ?, ?)",
+                (run_id, job_id, "running", started_at),
+            )
+            self.connection.commit()
+
+        status = "failed"
+        exit_code: int | None = None
+        stdout = ""
+        stderr = ""
+        error: str | None = None
+        try:
+            extra_args: list[str] = []
+            if job.get("skipPermissions") and job["agent"] == "claude":
+                extra_args.append("--dangerously-skip-permissions")
+            result = self.run_agent(
+                agent=job["agent"],
+                prompt=job["prompt"],
+                extra_args=extra_args if extra_args else None,
+                _internal=True,
+            )
+            status = str(result["status"])
+            exit_code = int(result["exitCode"])
+            stdout = str(result.get("stdout") or "")
+            stderr = str(result.get("stderr") or "")
+            return {"runId": run_id, "jobId": job_id, **result}
+        except Exception as exc:
+            error = str(exc)
+            stderr = error
+            _log("schedule.run_failed", job_id=job_id, run_id=run_id, error=error)
+            return {"runId": run_id, "jobId": job_id, "status": "failed", "error": error}
+        finally:
+            finished_at = _now_iso()
+            try:
+                next_run_at = _next_cron_run(job["cronExpr"])
+            except Exception as exc:
+                next_run_at = None
+                error = error or str(exc)
+                status = "failed"
+            with self.lock:
+                self.connection.execute(
+                    "UPDATE scheduled_runs SET status = ?, exit_code = ?, stdout = ?, stderr = ?, "
+                    "finished_at = ?, error = ? WHERE id = ?",
+                    (status, exit_code, stdout, stderr, finished_at, error, run_id),
+                )
+                self.connection.execute(
+                    "UPDATE scheduled_jobs SET running = 0, last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
+                    (finished_at, next_run_at, finished_at, job_id),
+                )
+                self.connection.commit()
+
     # -- agent execution -----------------------------------------------------
 
     def run_agent(
@@ -681,7 +1018,6 @@ class SessionStore:
         *,
         agent: str,
         prompt: str,
-        system_prompt: str | None = None,
         use_session: bool = True,
         session_id: str | None = None,
         messages: list[dict[str, Any]] | None = None,
@@ -689,6 +1025,7 @@ class SessionStore:
         cwd: str | None = None,
         timeout_ms: int | None = None,
         extra_args: list[str] | None = None,
+        _internal: bool = False,
     ) -> dict[str, Any]:
         if agent not in {"claude", "codex"}:
             raise ValueError("agent must be claude or codex")
@@ -697,38 +1034,34 @@ class SessionStore:
 
         active_session_id = self._resolve_session(agent, session_id)
         supplemental = normalize_messages(messages)
-        current_messages = self._build_current_messages(
-            prompt, system_prompt, supplemental, active_session_id, use_session
-        )
+        current_messages = self._build_current_messages(prompt, supplemental)
         self.append_messages(active_session_id, current_messages, agent=agent, is_session=use_session)
 
         request_messages = self._get_request_messages(active_session_id, current_messages, use_session)
 
         if agent == "claude":
-            compiled_system, compiled_prompt = compile_claude_parts(request_messages)
+            compiled_prompt = compile_claude_parts(request_messages)
         else:
-            compiled_system = None
             compiled_prompt = compile_codex_prompt(request_messages)
 
-        resolved_cwd = str(Path(cwd).resolve()) if cwd else str(Path.cwd())
+        resolved_cwd = str(Path(cwd).resolve()) if cwd else str(_get_base_dir())
         _log(
             "agent.compiled_prompt",
             agent=agent,
             session_id=active_session_id,
             use_session=use_session,
             cwd=resolved_cwd,
-            compiled_system=_truncate(compiled_system or ""),
             compiled_prompt=_truncate(compiled_prompt),
         )
 
         result = run_agent_cli(
             agent=agent,
             prompt=compiled_prompt,
-            system_prompt=compiled_system,
             cwd=resolved_cwd,
             timeout_ms=int(timeout_ms or self.default_timeout_ms),
             allowed_tools_pattern=allowed_tools_pattern,
             extra_args=extra_args or [],
+            _internal=_internal,
         )
         status = "completed" if result["exitCode"] == 0 else "failed"
 
@@ -755,11 +1088,545 @@ class SessionStore:
             "stderr": result["stderr"],
         }
         if _env_flag("ORCH_DEBUG", True):
-            payload["compiledSystem"] = compiled_system
             payload["compiledPrompt"] = compiled_prompt
         _log("agent.result", result=_truncate(_safe_json(payload)))
         return payload
 
+
+
+
+# ---------------------------------------------------------------------------
+# Local scheduler and Web UI
+# ---------------------------------------------------------------------------
+
+class ScheduleRunner:
+    """로컬 cron 작업을 백그라운드에서 실행하는 실행기."""
+
+    def __init__(self, *, store: SessionStore, interval_seconds: int = 30) -> None:
+        self.store = store
+        self.interval_seconds = max(5, int(interval_seconds or 30))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="orch-scheduler", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+        _log("schedule.runner_started", interval_seconds=self.interval_seconds)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        _log("schedule.runner_stopped")
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                for job_id in self.store.list_due_schedule_ids():
+                    threading.Thread(
+                        target=self.store.run_schedule,
+                        kwargs={"job_id": job_id},
+                        name=f"orch-schedule-{job_id[:8]}",
+                        daemon=True,
+                    ).start()
+            except Exception as exc:
+                _log("schedule.loop_error", error=str(exc))
+            self._stop.wait(self.interval_seconds)
+
+
+def _html_page(title: str, body: str) -> bytes:
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    :root {{
+      --bg-primary: #0f1923;
+      --bg-secondary: #1a2634;
+      --bg-card: #1e2d3d;
+      --bg-input: #0f1923;
+      --border: #2a3a4a;
+      --text-primary: #e2e8f0;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent-blue: #3b82f6;
+      --accent-green: #10b981;
+      --accent-red: #ef4444;
+      --accent-orange: #f59e0b;
+      --accent-purple: #8b5cf6;
+    }}
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif; background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; padding: 24px; }}
+    a {{ color: var(--accent-blue); text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+
+    .header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }}
+    .header h1 {{ font-size: 1.5rem; font-weight: 700; }}
+    .header .subtitle {{ color: var(--text-muted); font-size: 0.85rem; }}
+
+    .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }}
+    .stat-card {{ background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }}
+    .stat-card .label {{ color: var(--text-muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }}
+    .stat-card .value {{ font-size: 1.8rem; font-weight: 700; }}
+    .stat-card .value.blue {{ color: var(--accent-blue); }}
+    .stat-card .value.green {{ color: var(--accent-green); }}
+    .stat-card .value.red {{ color: var(--accent-red); }}
+    .stat-card .value.purple {{ color: var(--accent-purple); }}
+
+    .main-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+    .card {{ background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }}
+    .card h2 {{ font-size: 1.1rem; font-weight: 600; margin-bottom: 16px; }}
+
+    .form-group {{ margin-bottom: 16px; }}
+    .form-group label {{ display: block; color: var(--text-secondary); font-size: 0.85rem; margin-bottom: 6px; }}
+    .form-group input, .form-group textarea, .form-group select {{
+      width: 100%; background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px;
+      padding: 10px 12px; color: var(--text-primary); font-size: 0.9rem; outline: none; transition: border-color 0.2s;
+    }}
+    .form-group input:focus, .form-group textarea:focus, .form-group select:focus {{ border-color: var(--accent-blue); }}
+    .form-group textarea {{ min-height: 100px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }}
+    .form-group select {{ appearance: none; cursor: pointer; }}
+
+    .agent-select {{ display: flex; gap: 12px; }}
+    .agent-option {{ flex: 1; display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: var(--bg-input); border: 2px solid var(--border); border-radius: 8px; cursor: pointer; transition: border-color 0.2s; }}
+    .agent-option:has(input:checked) {{ border-color: var(--accent-blue); }}
+    .agent-option input {{ display: none; }}
+    .agent-option .agent-icon {{ width: 24px; height: 24px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.7rem; }}
+    .agent-option .agent-icon.claude {{ background: #d97706; color: #fff; }}
+    .agent-option .agent-icon.codex {{ background: #059669; color: #fff; }}
+    .agent-option .agent-name {{ font-size: 0.9rem; }}
+
+    .checkbox-group {{ display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }}
+    .checkbox-group input[type="checkbox"] {{ width: 16px; height: 16px; accent-color: var(--accent-blue); }}
+    .checkbox-group label {{ color: var(--text-secondary); font-size: 0.85rem; }}
+
+    .btn {{ padding: 10px 20px; border: none; border-radius: 8px; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }}
+    .btn:hover {{ opacity: 0.85; }}
+    .btn-primary {{ background: var(--accent-blue); color: #fff; }}
+    .btn-sm {{ padding: 6px 12px; font-size: 0.8rem; border-radius: 6px; }}
+    .btn-green {{ background: var(--accent-green); color: #fff; }}
+    .btn-orange {{ background: var(--accent-orange); color: #fff; }}
+    .btn-red {{ background: var(--accent-red); color: #fff; }}
+    .btn-ghost {{ background: transparent; border: 1px solid var(--border); color: var(--text-secondary); }}
+
+    .activity-list {{ list-style: none; }}
+    .activity-item {{ display: flex; align-items: flex-start; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }}
+    .activity-item:last-child {{ border-bottom: none; }}
+    .activity-dot {{ width: 8px; height: 8px; border-radius: 50%; margin-top: 6px; flex-shrink: 0; }}
+    .activity-dot.success {{ background: var(--accent-green); }}
+    .activity-dot.failed {{ background: var(--accent-red); }}
+    .activity-dot.running {{ background: var(--accent-orange); }}
+    .activity-info .activity-title {{ font-size: 0.9rem; margin-bottom: 2px; }}
+    .activity-info .activity-time {{ font-size: 0.75rem; color: var(--text-muted); }}
+
+    .schedule-list {{ list-style: none; }}
+    .schedule-item {{ display: flex; align-items: center; justify-content: space-between; padding: 14px 0; border-bottom: 1px solid var(--border); }}
+    .schedule-item:last-child {{ border-bottom: none; }}
+    .schedule-meta {{ display: flex; align-items: center; gap: 10px; }}
+    .schedule-meta .agent-badge {{ padding: 3px 8px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }}
+    .schedule-meta .agent-badge.claude {{ background: rgba(217,119,6,0.2); color: #f59e0b; }}
+    .schedule-meta .agent-badge.codex {{ background: rgba(5,150,105,0.2); color: #10b981; }}
+    .schedule-info .schedule-name {{ font-size: 0.9rem; font-weight: 500; }}
+    .schedule-info .schedule-cron {{ font-size: 0.75rem; color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .schedule-info .schedule-prompt {{ font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 400px; }}
+    .schedule-actions {{ display: flex; gap: 6px; align-items: center; }}
+    .schedule-actions form {{ display: inline; }}
+
+    .status-badge {{ display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }}
+    .status-badge.running {{ background: rgba(245,158,11,0.2); color: #f59e0b; }}
+    .status-badge.enabled {{ background: rgba(16,185,129,0.2); color: #10b981; }}
+    .status-badge.disabled {{ background: rgba(100,116,139,0.2); color: #94a3b8; }}
+
+    .empty {{ color: var(--text-muted); text-align: center; padding: 32px 0; font-size: 0.9rem; }}
+
+    .runs-table {{ width: 100%; border-collapse: collapse; }}
+    .runs-table th {{ text-align: left; padding: 10px 12px; color: var(--text-muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); }}
+    .runs-table td {{ padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 0.85rem; vertical-align: top; }}
+    .runs-table .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: var(--text-secondary); }}
+
+    .modal-overlay {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; align-items: center; justify-content: center; }}
+    .modal-overlay.active {{ display: flex; }}
+    .modal {{ background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px; padding: 32px; width: 90%; max-width: 520px; max-height: 90vh; overflow-y: auto; }}
+    .modal h2 {{ margin-bottom: 20px; }}
+    .modal .btn-row {{ display: flex; gap: 12px; margin-top: 20px; }}
+
+    @media (max-width: 900px) {{
+      .stats {{ grid-template-columns: repeat(2, 1fr); }}
+      .main-grid {{ grid-template-columns: 1fr; }}
+    }}
+  </style>
+</head>
+<body>
+{body}
+
+<div class="modal-overlay" id="editModal">
+  <div class="modal">
+    <h2>스케줄 편집</h2>
+    <form method="post" action="/schedule/update" id="editForm">
+      <input type="hidden" name="jobId" id="edit-jobId">
+      <div class="form-group">
+        <label>Name</label>
+        <input name="name" id="edit-name" required>
+      </div>
+      <div class="form-group">
+        <label>Agent</label>
+        <div class="agent-select">
+          <label class="agent-option">
+            <input type="radio" name="agent" value="claude" id="edit-agent-claude">
+            <span class="agent-icon claude">C</span>
+            <span class="agent-name">Claude</span>
+          </label>
+          <label class="agent-option">
+            <input type="radio" name="agent" value="codex" id="edit-agent-codex">
+            <span class="agent-icon codex">X</span>
+            <span class="agent-name">Codex</span>
+          </label>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Cron Expression</label>
+        <input name="cronExpr" id="edit-cronExpr" required>
+      </div>
+      <div class="form-group">
+        <label>Prompt</label>
+        <textarea name="prompt" id="edit-prompt" required></textarea>
+      </div>
+      <div class="checkbox-group">
+        <input type="checkbox" name="skipPermissions" id="edit-skipPermissions">
+        <label for="edit-skipPermissions">Skip Permissions (파일 쓰기 허용)</label>
+      </div>
+      <div class="checkbox-group">
+        <input type="checkbox" name="enabled" id="edit-enabled">
+        <label for="edit-enabled">활성</label>
+      </div>
+      <div class="btn-row">
+        <button type="submit" class="btn btn-primary">Save Changes</button>
+        <button type="button" class="btn btn-ghost" onclick="closeEditModal()">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+function openEditModal(jobId) {{
+  fetch('/api/schedule?jobId=' + encodeURIComponent(jobId))
+    .then(r => r.json())
+    .then(job => {{
+      document.getElementById('edit-jobId').value = job.id;
+      document.getElementById('edit-name').value = job.name;
+      document.getElementById('edit-cronExpr').value = job.cronExpr;
+      document.getElementById('edit-prompt').value = job.prompt;
+      document.getElementById('edit-skipPermissions').checked = !!job.skipPermissions;
+      document.getElementById('edit-enabled').checked = !!job.enabled;
+      if (job.agent === 'codex') {{
+        document.getElementById('edit-agent-codex').checked = true;
+      }} else {{
+        document.getElementById('edit-agent-claude').checked = true;
+      }}
+      document.getElementById('editModal').classList.add('active');
+    }});
+}}
+function closeEditModal() {{
+  document.getElementById('editModal').classList.remove('active');
+}}
+document.getElementById('editModal').addEventListener('click', function(e) {{
+  if (e.target === this) closeEditModal();
+}});
+</script>
+</body>
+</html>""".encode("utf-8")
+
+
+def _form_bool(values: dict[str, list[str]], key: str, default: bool = False) -> bool:
+    if key not in values:
+        return default
+    return str(values.get(key, [""])[0]).lower() in {"1", "true", "on", "yes"}
+
+
+def _form_int(values: dict[str, list[str]], key: str) -> int | None:
+    raw = values.get(key, [""])[0].strip()
+    return int(raw) if raw else None
+
+
+class WebUiHandler(BaseHTTPRequestHandler):
+    server_version = "OrchestrationWebUI/0.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        _log("web.access", client=self.client_address[0], message=fmt % args)
+
+    @property
+    def store(self) -> SessionStore:
+        return _get_store()
+
+    def _send(self, status: HTTPStatus, body: str | bytes, content_type: str = "text/html; charset=utf-8") -> None:
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _redirect(self, location: str = "/") -> None:
+        self.send_response(HTTPStatus.SEE_OTHER.value)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def _read_form(self) -> dict[str, list[str]]:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        return parse_qs(raw, keep_blank_values=True)
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            self._send(HTTPStatus.OK, json.dumps(self.store.get_health(), ensure_ascii=False), "application/json; charset=utf-8")
+            return
+        if parsed.path == "/runs":
+            query = parse_qs(parsed.query)
+            self._render_runs(query.get("jobId", [None])[0])
+            return
+        if parsed.path == "/api/schedule":
+            query = parse_qs(parsed.query)
+            job_id = query.get("jobId", [None])[0]
+            if job_id:
+                job = self.store.get_schedule(job_id)
+                if job:
+                    self._send(HTTPStatus.OK, json.dumps(job, ensure_ascii=False), "application/json; charset=utf-8")
+                    return
+            self._send(HTTPStatus.NOT_FOUND, json.dumps({"error": "not found"}), "application/json; charset=utf-8")
+            return
+        self._render_index()
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        form = self._read_form()
+        try:
+            if parsed.path == "/schedule/create":
+                self.store.create_schedule(
+                    name=form.get("name", [""])[0],
+                    agent=form.get("agent", ["claude"])[0],
+                    cron_expr=form.get("cronExpr", [""])[0],
+                    prompt=form.get("prompt", [""])[0],
+                    skip_permissions=_form_bool(form, "skipPermissions", False),
+                    enabled=_form_bool(form, "enabled", False),
+                )
+            elif parsed.path == "/schedule/toggle":
+                job_id = form.get("jobId", [""])[0]
+                enabled = _form_bool(form, "enabled", False)
+                self.store.update_schedule(job_id=job_id, enabled=enabled)
+            elif parsed.path == "/schedule/delete":
+                self.store.delete_schedule(form.get("jobId", [""])[0])
+            elif parsed.path == "/schedule/update":
+                job_id = form.get("jobId", [""])[0]
+                self.store.update_schedule(
+                    job_id=job_id,
+                    name=form.get("name", [None])[0] or None,
+                    agent=form.get("agent", [None])[0] or None,
+                    cron_expr=form.get("cronExpr", [None])[0] or None,
+                    prompt=form.get("prompt", [None])[0] or None,
+                    skip_permissions=_form_bool(form, "skipPermissions", False),
+                    enabled=_form_bool(form, "enabled", False),
+                )
+            elif parsed.path == "/schedule/run":
+                self.store.run_schedule(form.get("jobId", [""])[0], force=True)
+            else:
+                self._send(HTTPStatus.NOT_FOUND, _html_page("Not found", "<h1>Not found</h1>"))
+                return
+            self._redirect("/")
+        except Exception as exc:
+            self._send(HTTPStatus.BAD_REQUEST, _html_page("Error", f"<h1>요청 실패</h1><p class='danger'>{html.escape(str(exc))}</p><p><a href='/'>돌아가기</a></p>"))
+
+    def _render_index(self) -> None:
+        jobs = self.store.list_schedules(include_disabled=True)
+        runs = self.store.list_schedule_runs(job_id=None, limit=10)
+
+        # 통계 계산
+        active_count = sum(1 for j in jobs if j["enabled"])
+        total_runs = len(runs)
+        failed_runs = sum(1 for r in runs if r["status"] == "failed")
+        agents_used = len(set(j["agent"] for j in jobs)) if jobs else 0
+
+        # 최근 활동
+        activity_items = []
+        for run in runs[:8]:
+            status_class = "success" if run["status"] == "completed" else ("running" if run["status"] == "running" else "failed")
+            job_name = next((j["name"] for j in jobs if j["id"] == run["jobId"]), run["jobId"][:8])
+            activity_items.append(f"""
+<li class="activity-item">
+  <span class="activity-dot {status_class}"></span>
+  <div class="activity-info">
+    <div class="activity-title">{html.escape(job_name)} — {html.escape(run['status'])}</div>
+    <div class="activity-time">{html.escape(str(run['startedAt']))}</div>
+  </div>
+</li>""")
+
+        # 활성 스케줄 목록
+        schedule_items = []
+        for job in jobs:
+            status = "running" if job["running"] else ("enabled" if job["enabled"] else "disabled")
+            toggle_value = "0" if job["enabled"] else "1"
+            toggle_btn_class = "btn-orange" if job["enabled"] else "btn-green"
+            toggle_label = "Pause" if job["enabled"] else "Enable"
+            agent_class = html.escape(job["agent"])
+            prompt_preview = _truncate(job["prompt"], 80)
+            schedule_items.append(f"""
+<li class="schedule-item">
+  <div style="display:flex;align-items:center;gap:12px;flex:1;min-width:0;">
+    <div class="schedule-meta">
+      <span class="agent-badge {agent_class}">{html.escape(job['agent'])}</span>
+    </div>
+    <div class="schedule-info" style="min-width:0;flex:1;">
+      <div class="schedule-name">{html.escape(job['name'])} <span class="status-badge {status}">{status}</span></div>
+      <div class="schedule-cron">{html.escape(job['cronExpr'])}</div>
+      <div class="schedule-prompt">{html.escape(prompt_preview)}</div>
+    </div>
+  </div>
+  <div class="schedule-actions">
+    <form method="post" action="/schedule/run"><input type="hidden" name="jobId" value="{html.escape(job['id'])}"><button class="btn btn-sm btn-green">Run Now</button></form>
+    <button class="btn btn-sm btn-primary" onclick="openEditModal('{html.escape(job['id'])}')">Edit</button>
+    <form method="post" action="/schedule/toggle"><input type="hidden" name="jobId" value="{html.escape(job['id'])}"><input type="hidden" name="enabled" value="{toggle_value}"><button class="btn btn-sm {toggle_btn_class}">{toggle_label}</button></form>
+    <form method="post" action="/schedule/delete" onsubmit="return confirm('Delete this schedule?')"><input type="hidden" name="jobId" value="{html.escape(job['id'])}"><button class="btn btn-sm btn-red">Delete</button></form>
+    <a href="/runs?jobId={html.escape(job['id'])}" class="btn btn-sm btn-ghost">Runs</a>
+  </div>
+</li>""")
+
+        body = f"""
+<div class="header">
+  <div>
+    <h1>MCP Orchestration</h1>
+    <span class="subtitle">스케줄 관리 대시보드</span>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat-card"><div class="label">Active Schedules</div><div class="value blue">{active_count}</div></div>
+  <div class="stat-card"><div class="label">Total Runs (Recent)</div><div class="value green">{total_runs}</div></div>
+  <div class="stat-card"><div class="label">Failed Runs</div><div class="value red">{failed_runs}</div></div>
+  <div class="stat-card"><div class="label">Agents</div><div class="value purple">{agents_used}</div></div>
+</div>
+
+<div class="main-grid">
+  <div class="card">
+    <h2>Create Schedule</h2>
+    <form method="post" action="/schedule/create">
+      <div class="form-group">
+        <label>Name</label>
+        <input name="name" placeholder="스케줄 이름" required>
+      </div>
+      <div class="form-group">
+        <label>Agent</label>
+        <div class="agent-select">
+          <label class="agent-option">
+            <input type="radio" name="agent" value="claude" checked>
+            <span class="agent-icon claude">C</span>
+            <span class="agent-name">Claude</span>
+          </label>
+          <label class="agent-option">
+            <input type="radio" name="agent" value="codex">
+            <span class="agent-icon codex">X</span>
+            <span class="agent-name">Codex</span>
+          </label>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Cron Expression</label>
+        <input name="cronExpr" value="*/10 * * * *" placeholder="*/10 * * * *" required>
+      </div>
+      <div class="form-group">
+        <label>Prompt</label>
+        <textarea name="prompt" placeholder="실행할 프롬프트를 입력..." required></textarea>
+      </div>
+      <div class="checkbox-group">
+        <input type="checkbox" name="skipPermissions" id="skip-perm-check" checked>
+        <label for="skip-perm-check">Skip Permissions (파일 쓰기 허용)</label>
+      </div>
+      <div class="checkbox-group">
+        <input type="checkbox" name="enabled" id="enabled-check" checked>
+        <label for="enabled-check">활성화하여 생성</label>
+      </div>
+      <button type="submit" class="btn btn-primary">Create Schedule</button>
+    </form>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:24px;">
+    <div class="card">
+      <h2>Recent Activity</h2>
+      {f'<ul class="activity-list">{"".join(activity_items)}</ul>' if activity_items else '<div class="empty">실행 기록 없음</div>'}
+      <div style="margin-top:12px;"><a href="/runs">모든 실행 기록 보기 →</a></div>
+    </div>
+
+    <div class="card">
+      <h2>Active Schedules</h2>
+      {f'<ul class="schedule-list">{"".join(schedule_items)}</ul>' if schedule_items else '<div class="empty">등록된 스케줄 없음</div>'}
+    </div>
+  </div>
+</div>
+"""
+        self._send(HTTPStatus.OK, _html_page("MCP Orchestration", body))
+
+    def _render_runs(self, job_id: str | None) -> None:
+        runs = self.store.list_schedule_runs(job_id=job_id, limit=50)
+        rows = []
+        for run in runs:
+            status_class = "success" if run["status"] == "completed" else ("running" if run["status"] == "running" else "failed")
+            status_color = "var(--accent-green)" if run["status"] == "completed" else ("var(--accent-orange)" if run["status"] == "running" else "var(--accent-red)")
+            rows.append(f"""
+<tr>
+  <td class="mono">{html.escape(run['id'][:12])}</td>
+  <td><span class="status-badge {status_class}">{html.escape(run['status'])}</span></td>
+  <td style="color:{status_color}">{html.escape(str(run['exitCode']))}</td>
+  <td class="mono">{html.escape(str(run['startedAt']))}</td>
+  <td class="mono">{html.escape(str(run['finishedAt'] or '-'))}</td>
+  <td class="mono" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;">{html.escape(_truncate(run.get('stderr') or run.get('error') or '-', 300))}</td>
+</tr>""")
+        filter_label = f' — job: {html.escape(job_id[:12])}' if job_id else ""
+        body = f"""
+<div class="header">
+  <div>
+    <h1>실행 기록{filter_label}</h1>
+    <span class="subtitle"><a href="/">← 대시보드로 돌아가기</a></span>
+  </div>
+</div>
+<div class="card">
+  <table class="runs-table">
+    <thead><tr><th>Run ID</th><th>Status</th><th>Exit</th><th>Started</th><th>Finished</th><th>Error/Stderr</th></tr></thead>
+    <tbody>{''.join(rows) if rows else '<tr><td colspan="6" class="empty">실행 기록 없음</td></tr>'}</tbody>
+  </table>
+</div>
+"""
+        self._send(HTTPStatus.OK, _html_page("실행 기록", body))
+
+
+
+def _start_web_ui() -> None:
+    global _web_server, _web_thread
+    if not _env_flag("ORCH_WEB_ENABLED", True):
+        _log("web.disabled")
+        return
+    host = os.getenv("ORCH_WEB_HOST", "127.0.0.1")
+    port = int(os.getenv("ORCH_WEB_PORT", "18765"))
+    try:
+        _web_server = ThreadingHTTPServer((host, port), WebUiHandler)
+        _web_thread = threading.Thread(target=_web_server.serve_forever, name="orch-web-ui", daemon=True)
+        _web_thread.start()
+        _log("web.started", host=host, port=port)
+    except Exception as exc:
+        _log("web.start_failed", host=host, port=port, error=str(exc))
+        _web_server = None
+        _web_thread = None
+
+
+def _stop_web_ui() -> None:
+    global _web_server, _web_thread
+    if _web_server is None:
+        return
+    _web_server.shutdown()
+    _web_server.server_close()
+    if _web_thread is not None:
+        _web_thread.join(timeout=5)
+    _log("web.stopped")
+    _web_server = None
+    _web_thread = None
 
 # ---------------------------------------------------------------------------
 # Server configuration
@@ -769,15 +1636,17 @@ def _get_root_dir() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _get_base_dir() -> Path:
+    """CLI 실행 시 기본 작업 디렉터리를 반환한다."""
+    return BASE_DIR
+
+
 def _get_db_path() -> Path:
     return Path(os.getenv("ORCH_DB_PATH", str(_get_root_dir() / "data" / "orchestrator.sqlite"))).resolve()
 
 
 def _get_transport() -> Transport:
-    transport = os.getenv("ORCH_TRANSPORT", "streamable-http").strip().lower()
-    if transport not in {"stdio", "sse", "streamable-http"}:
-        raise ValueError("ORCH_TRANSPORT must be one of: stdio, sse, streamable-http")
-    return transport  # type: ignore[return-value]
+    return "streamable-http"
 
 
 def _get_store() -> SessionStore:
@@ -786,9 +1655,9 @@ def _get_store() -> SessionStore:
     return _store
 
 
-@contextlib.asynccontextmanager
-async def server_lifespan(_: FastMCP) -> AsyncIterator[None]:
-    global _connection, _store
+def _initialize() -> None:
+    """서버 시작 전에 DB, Scheduler, Web UI를 초기화한다."""
+    global _connection, _store, _scheduler
 
     db_path = _get_db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -796,25 +1665,49 @@ async def server_lifespan(_: FastMCP) -> AsyncIterator[None]:
     _store = SessionStore(
         connection=_connection,
         db_path=str(db_path),
-        default_timeout_ms=int(os.getenv("ORCH_DEFAULT_TIMEOUT_MS", "120000")),
+        default_timeout_ms=DEFAULT_TIMEOUT_MS,
     )
+    _scheduler = ScheduleRunner(
+        store=_store,
+        interval_seconds=int(os.getenv("ORCH_SCHEDULER_INTERVAL_SECONDS", "30")),
+    )
+    _scheduler.start()
+    _start_web_ui()
     _log(
         "server.start",
         db_path=str(db_path),
         transport=_get_transport(),
         host=os.getenv("ORCH_HOST", os.getenv("ORCH_SSE_HOST", "127.0.0.1")),
         port=int(os.getenv("ORCH_PORT", os.getenv("ORCH_SSE_PORT", "18282"))),
+        web_enabled=_env_flag("ORCH_WEB_ENABLED", True),
+        web_host=os.getenv("ORCH_WEB_HOST", "127.0.0.1"),
+        web_port=int(os.getenv("ORCH_WEB_PORT", "18765")),
         debug=_env_flag("ORCH_DEBUG", True),
         log_level=os.getenv("ORCH_LOG_LEVEL", "DEBUG"),
     )
+
+
+def _shutdown() -> None:
+    """서버 종료 시 리소스를 해제한다."""
+    global _connection, _store, _scheduler
+    _log("server.stop")
+    _stop_web_ui()
+    if _scheduler is not None:
+        _scheduler.stop()
+        _scheduler = None
+    if _connection is not None:
+        _connection.close()
+    _connection = None
+    _store = None
+
+
+@contextlib.asynccontextmanager
+async def server_lifespan(_: FastMCP) -> AsyncIterator[None]:
+    # 초기화는 main()에서 이미 수행했다. lifespan은 종료 처리만 담당한다.
     try:
         yield
     finally:
-        _log("server.stop")
-        if _connection is not None:
-            _connection.close()
-        _connection = None
-        _store = None
+        _shutdown()
 
 
 mcp = FastMCP(
@@ -832,6 +1725,94 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 # MCP tool handlers
 # ---------------------------------------------------------------------------
+
+@mcp.tool(name="orchestrator_usage", description="이 MCP 서버의 사용 가이드를 반환합니다. AI가 도구를 올바르게 호출하기 위한 절차와 예시를 포함합니다.")
+def orchestrator_usage() -> dict[str, Any]:
+    """AI 에이전트가 이 MCP 서버의 도구 모음을 올바르게 사용하기 위한 가이드를 반환한다."""
+    _log_tool_call("orchestrator_usage")
+    guide = {
+        "overview": (
+            "이 서버는 Claude/Codex CLI를 세션과 함께 실행하는 오케스트레이터입니다."
+            "user/assistant 메시지 기록을 세션에 저장하여 문맥을 유지한 대화를 지원합니다."
+        ),
+        "workflow": [
+            "1. orchestrator_health로 서버가 정상인지 확인한다(선택 사항).",
+            "2. session_create로 세션을 생성한다(생략 가능 — agent_run이 자동 생성 가능).",
+            "3. agent_run으로 Claude/Codex에 질문을 보내고 응답을 받는다.",
+            "4. 동일한 sessionId로 agent_run을 반복하면 대화가 이어진다.",
+            "5. session_get으로 이전 대화 기록을 확인할 수 있다.",
+        ],
+        "tools": {
+            "orchestrator_health": {
+                "purpose": "서버 상태 확인",
+                "params": "없음",
+            },
+            "orchestrator_usage": {
+                "purpose": "이 사용 가이드 조회",
+                "params": "없음",
+            },
+            "session_create": {
+                "purpose": "새 세션 생성. 초기 메시지도 함께 전달 가능",
+                "params": {
+                    "title": "(선택 사항) 세션 이름",
+                    "messages": "(선택 사항) [{role: 'user'|'assistant', content: '...'}] 형식의 초기 메시지 배열",
+                },
+            },
+            "session_get": {
+                "purpose": "세션의 전체 메시지 기록 조회",
+                "params": {"sessionId": "(필수) 세션 ID"},
+            },
+            "session_list": {
+                "purpose": "최근 세션 목록 조회",
+                "params": {"limit": "(선택 사항) 조회 개수. 기본값 20, 최대 100"},
+            },
+            "session_append": {
+                "purpose": "기존 세션에 메시지를 수동 추가(CLI 실행 없이 기록만 추가할 때)",
+                "params": {
+                    "sessionId": "(필수) 세션 ID",
+                    "messages": "(필수) [{role, content}] 배열",
+                },
+            },
+            "session_delete": {
+                "purpose": "세션과 전체 메시지 삭제",
+                "params": {"sessionId": "(필수) 세션 ID"},
+            },
+            "agent_run": {
+                "purpose": "Claude 또는 Codex CLI를 실행하고 결과를 세션에 저장",
+                "params": {
+                    "agent": "(필수) 'claude' 또는 'codex'",
+                    "prompt": "(필수) 사용자 질문 텍스트",
+                    "promptBase64": "(선택 사항) prompt를 Base64 인코딩으로 전달할 때 사용",
+                    "useSession": "(선택 사항) true: 세션 기록 사용. 기본값 true",
+                    "sessionId": "(선택 사항) 기존 세션 ID. 생략 시 새로 생성",
+                    "messages": "(선택 사항) 추가 컨텍스트 메시지 [{role, content}]",
+                    "allowedToolsPattern": "(선택 사항) CLI에 전달할 허용 도구 패턴. 기본값 '*'",
+                    "cwd": "(선택 사항) CLI 실행 디렉터리",
+                    "timeoutMs": "(선택 사항) 타임아웃 ms. 기본값 120000",
+                    "extraArgs": "(선택 사항) CLI에 전달할 추가 인수 문자열 배열",
+                },
+                "returns": {
+                    "sessionId": "사용된 세션 ID",
+                    "status": "'completed' 또는 'failed'",
+                    "stdout": "CLI 표준 출력(응답 본문)",
+                    "stderr": "CLI 표준 에러 출력",
+                    "exitCode": "프로세스 종료 코드(0 = 성공)",
+                },
+                "example": {
+                    "call": 'agent_run(agent="claude", prompt="Python으로 피보나치 수열을 작성해 줘")',
+                    "continuation": 'agent_run(agent="claude", prompt="재귀 버전으로 바꿔 줘", sessionId="<이전 sessionId>")',
+                },
+            },
+        },
+        "notes": [
+            "role은 'user'와 'assistant'만 사용할 수 있습니다('system'은 미지원).",
+            "세션을 사용하면 이전 user/assistant 메시지가 자동으로 프롬프트에 포함됩니다.",
+            "긴 프롬프트는 promptBase64로 Base64 인코딩하여 전달할 수 있습니다.",
+        ],
+    }
+    _log_tool_result("orchestrator_usage", {"keys": list(guide.keys())})
+    return guide
+
 
 @mcp.tool(name="orchestrator_health", description="서버 상태와 DB 경로를 반환합니다.")
 def orchestrator_health() -> dict[str, Any]:
@@ -885,7 +1866,7 @@ def session_append(
     return result
 
 
-@mcp.tool(name="session_delete", description="세션과 연결 메시지를 삭제합니다.")
+@mcp.tool(name="session_delete", description="세션과 관련 메시지를 삭제합니다.")
 def session_delete(sessionId: str) -> dict[str, Any]:
     _log_tool_call("session_delete", sessionId=sessionId)
     result = _get_store().delete_session(sessionId)
@@ -893,13 +1874,12 @@ def session_delete(sessionId: str) -> dict[str, Any]:
     return result
 
 
-@mcp.tool(name="agent_run", description="Claude 또는 Codex CLI를 실행하고 필요 시 세션에 저장합니다.")
+
+@mcp.tool(name="agent_run", description="Claude 또는 Codex CLI를 실행하고 필요하면 세션에 저장합니다.")
 def agent_run(
     agent: Literal["claude", "codex"],
     prompt: str = "",
     promptBase64: str | None = None,
-    systemPrompt: str | None = None,
-    systemPromptBase64: str | None = None,
     useSession: bool = True,
     sessionId: str | None = None,
     messages: list[dict[str, Any]] | None = None,
@@ -909,12 +1889,10 @@ def agent_run(
     extraArgs: list[str] | None = None,
 ) -> dict[str, Any]:
     resolved_prompt = _resolve_text_value(prompt, promptBase64, field_name="prompt")
-    resolved_system = _resolve_text_value(systemPrompt, systemPromptBase64, field_name="systemPrompt") or None
     _log_tool_call(
         "agent_run",
         agent=agent,
         prompt=_truncate(resolved_prompt),
-        systemPrompt=_truncate(resolved_system or ""),
         useSession=useSession,
         sessionId=sessionId,
         allowedToolsPattern=allowedToolsPattern,
@@ -924,7 +1902,6 @@ def agent_run(
     result = _get_store().run_agent(
         agent=agent,
         prompt=resolved_prompt,
-        system_prompt=resolved_system,
         use_session=useSession,
         session_id=sessionId,
         messages=messages,
@@ -945,6 +1922,7 @@ def main() -> None:
     _configure_console_utf8()
     _install_runtime_guards()
     _log("process.start", file=__file__, transport=_get_transport())
+    _initialize()
     exit_code = 0
     try:
         mcp.run(transport=_get_transport())
@@ -952,6 +1930,7 @@ def main() -> None:
         exit_code = 130
         _log("process.keyboard_interrupt")
     finally:
+        _shutdown()
         _cancel_shutdown_timer()
         _log("process.exit", exit_code=exit_code)
 

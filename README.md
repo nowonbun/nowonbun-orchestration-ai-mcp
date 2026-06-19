@@ -1,167 +1,127 @@
-# nowonbun-orchestration-ai-mcp
+# MCP Orchestration AI
 
-FastMCP 기반으로 Claude CLI와 Codex CLI를 하나의 MCP 서버에서 실행하고, 세션 메시지를 SQLite에 단순하게 저장하는 Python 서버입니다.
+Python에서 `claude -p`와 `codex exec`를 호출하고, MCP Tool과 SQLite 세션 관리를 제공하는 경량 오케스트레이션 서버.
 
-## 구조
-- 런타임 코드는 `src/server.py` 한 파일입니다.
-- MCP 서버 구현은 커스텀 JSON-RPC 루프가 아니라 `mcp.server.fastmcp.FastMCP`를 사용합니다.
-- DB는 `sessions`, `messages` 두 테이블만 사용합니다.
-- `messages`는 `session_id`, `role`, `content`, `agent`, `created_at`, `sort_order`, `is_session`을 저장합니다.
+## 개요
 
-## 요구 사항
-- Python 3.13 이상
-- `mcp[cli]` 1.26 이상, 2 미만
-- 전역 설치된 CLI
-  - `claude`
-  - `codex`
+- **MCP 서버**(streamable-http)로서 Claude Code 및 다른 MCP client에서 tool 호출 가능
+- **Web UI**(port 18765)에서 로컬 브라우저로 schedule job 관리
+- SQLite를 통한 대화 기록(session) 영속화
+- 외부 의존성은 최소화(`mcp` 패키지만 사용)
 
-## 실행
+## 전제 조건
+
+- Python 3.12+
+- `claude` CLI가 설치되어 있어야 함(`claude -p` 동작 확인)
+- `codex` CLI 사용 시 `codex exec`가 동작해야 함
+
+## 설정
+
+`src/server.py` 상단 Configuration 섹션에서 설정한다.
+
+```python
+BASE_DIR = Path("/Users/soonyub.hwang/desk")  # CLI 실행 시 기본 작업 디렉터리
+DEFAULT_TIMEOUT_MS = 3000000                   # CLI 실행 타임아웃(ms)
+```
+
+- `BASE_DIR`: `agent_run`에서 `cwd`를 지정하지 않았을 때 CLI가 실행될 디렉터리. 이 디렉터리의 `.mcp.json`, `CLAUDE.md`, skills가 CLI에 적용된다.
+- `DEFAULT_TIMEOUT_MS`: CLI 실행 기본 타임아웃.
+
+## 실행 방법
+
 ```bash
-set PYTHONPATH=D:\work\nowonbun-orchestration-ai-mcp\src
-set ORCH_TRANSPORT=streamable-http
-set ORCH_HOST=127.0.0.1
-set ORCH_PORT=18282
-python D:\work\nowonbun-orchestration-ai-mcp\src\server.py
+cd lsm-ai/tools/mcp-orchestration-ai
+python src/server.py
 ```
 
-기본 실행 transport는 `streamable-http`입니다.
-기본 MCP 엔드포인트는 `http://127.0.0.1:18282/mcp`입니다.
+실행하면 아래 두 서버가 동시에 시작된다:
 
-## 환경 변수
-- `ORCH_DB_PATH`: SQLite 파일 경로, 기본값 `./data/orchestrator.sqlite`
-- `ORCH_TRANSPORT`: `stdio`, `sse`, `streamable-http` 중 하나, 기본값 `streamable-http`
-- `ORCH_HOST`: HTTP 계열 transport host, 기본값 `127.0.0.1`
-- `ORCH_PORT`: HTTP 계열 transport port, 기본값 `18282`
-- `ORCH_DEFAULT_TIMEOUT_MS`: 기본값 `120000`
+| 서버 | 기본 주소 | 설명 |
+|---|---|---|
+| MCP (streamable-http) | `http://127.0.0.1:18282/mcp/` | MCP client용 엔드포인트 |
+| Web UI | `http://127.0.0.1:18765` | schedule job 관리 화면 |
 
-서버형 실행 예시:
-```bash
-set ORCH_TRANSPORT=streamable-http
-set ORCH_HOST=127.0.0.1
-set ORCH_PORT=18282
-python D:\work\nowonbun-orchestration-ai-mcp\src\server.py
-```
+## Claude Code에 등록
 
-stdio 실행 예시:
-```bash
-set ORCH_TRANSPORT=stdio
-python D:\work\nowonbun-orchestration-ai-mcp\src\server.py
-```
-
-## MCP 도구
-
-### `orchestrator_health`
-서버 상태, DB 경로, transport, host, port를 반환합니다.
-
-### `session_create`
-세션을 만들고 초기 메시지를 저장합니다.
-
-예시:
-```json
-{
-  "title": "spring-study",
-  "messages": [
-    { "role": "system", "content": "너는 개발 도우미다." },
-    { "role": "user", "content": "Spring Boot 설명해줘" }
-  ]
-}
-```
-
-### `session_get`
-세션과 메시지 목록을 조회합니다.
-
-### `session_list`
-최근 세션 목록을 조회합니다.
-
-### `session_append`
-기존 세션에 메시지를 추가합니다.
-
-### `session_delete`
-세션과 메시지를 삭제합니다.
-
-### `agent_run`
-Claude 또는 Codex를 실행합니다.
-
-예시:
-```json
-{
-  "agent": "claude",
-  "useSession": true,
-  "sessionId": "세션ID",
-  "systemPrompt": "너는 개발 도우미다.",
-  "prompt": "JPA 설명해줘",
-  "allowedToolsPattern": "mcp__*",
-  "cwd": "D:/work",
-  "timeoutMs": 120000
-}
-```
-
-## 세션 저장 방식
-- `useSession: true`
-  - `sessionId`가 있으면 기존 세션을 사용합니다.
-  - `sessionId`가 없으면 새 세션을 자동 생성합니다.
-  - 요청 메시지와 응답 메시지를 모두 DB에 저장합니다.
-  - 다음 호출 시 `is_session = 1` 메시지만 이어서 프롬프트를 구성합니다.
-- `useSession: false`
-  - 요청 메시지와 응답 메시지를 모두 DB에 저장합니다.
-  - 단, 이번 호출에서 저장한 `is_session = 0` 메시지는 다음 호출 세션 문맥에 재사용하지 않습니다.
-
-## messages 컬럼 의미
-- `role`: `system`, `user`, `assistant`, `tool`
-- `agent`: 발화를 처리한 에이전트 이름입니다. `claude`, `codex`처럼 저장합니다.
-- 사용자 입력 행은 `role = "user"`로 저장되고, `agent`는 해당 호출을 처리한 에이전트명으로 저장됩니다.
-- 모델 응답 행은 `role = "assistant"`로 저장되고, `agent`는 해당 응답을 만든 에이전트명으로 저장됩니다.
-- 수동으로 생성한 초기 세션 메시지는 에이전트가 정해지지 않았으면 `agent = null`일 수 있습니다.
-
-## Transport
-- `streamable-http`: 기본 서버 운영 방식, 기본 엔드포인트는 `http://127.0.0.1:18282/mcp`
-- `stdio`: Codex/Claude가 프로세스를 직접 붙는 방식
-- `sse`: FastMCP SSE transport
-- `streamable-http`: FastMCP Streamable HTTP transport
-
-## Codex 등록 예시 (`config.toml`)
-아래 형식은 `C:\Users\nowonbun\.codex\config.toml`의 실제 MCP 등록 형식인 `[mcp_servers.<name>]` 구조를 기준으로 작성했습니다.
-
-```toml
-[mcp_servers.nowonbun_orchestration]
-url = "http://127.0.0.1:18282/mcp"
-tool_timeout_sec = 300
-```
-
-로컬 프로세스를 직접 붙는 stdio 등록이 필요하면:
-
-```toml
-[mcp_servers.nowonbun_orchestration]
-command = "python"
-args = ["D:/work/nowonbun-orchestration-ai-mcp/src/server.py"]
-tool_timeout_sec = 300
-
-[mcp_servers.nowonbun_orchestration.env]
-ORCH_TRANSPORT = "stdio"
-PYTHONPATH = "D:/work/nowonbun-orchestration-ai-mcp/src"
-```
-
-## 참고
-- 기존 커스텀 MCP JSON-RPC 루프와 커스텀 SSE 서버는 제거했습니다.
-- FastMCP API는 공식 `modelcontextprotocol/python-sdk` README의 v1.x FastMCP 예제를 기준으로 맞췄습니다.
-- 메시지 순서는 `sort_order` 컬럼으로 관리하고 API 응답에는 `order`로 반환합니다.
-
-## Claude ?? ?? (`mcpServers` JSON)
-?? ??? Claude Desktop / Claude Code?? ?? ???? `mcpServers` JSON ?? ?????. ???? ??: ? ??? ?? ?? Claude ?? ??? ?? ??? ??? ??, ? ??? ?? JSON ??? Claude? ?? ???? ??? ? ????.
+Claude Code의 MCP 설정(`~/.claude/settings.json` 또는 프로젝트 `.mcp.json`)에 추가한다.
 
 ```json
 {
   "mcpServers": {
-    "nowonbun_orchestration": {
-      "command": "python",
-      "args": ["D:/work/nowonbun-orchestration-ai-mcp/src/server.py"],
-      "env": {
-        "ORCH_TRANSPORT": "stdio",
-        "PYTHONPATH": "D:/work/nowonbun-orchestration-ai-mcp/src"
-      }
+    "orchestration-ai": {
+      "type": "url",
+      "url": "http://127.0.0.1:18282/mcp/"
     }
   }
 }
 ```
 
-? ??? ?? URL? ?? ??? ???, Claude? ??? ? ?? ????? ?? ???? ?????.
+사전에 `python src/server.py`로 서버를 실행해 두어야 한다.
+
+## Codex에 등록
+
+Codex 설정 파일 `~/.codex/config.toml`에 추가한다.
+
+```toml
+[mcp_servers.mcp-orchestration]
+type = "url"
+url = "http://127.0.0.1:18282/mcp/"
+```
+
+사전에 `python src/server.py`로 서버를 실행해 두어야 한다.
+
+## MCP Tool 목록
+
+| Tool | 설명 |
+|---|---|
+| `orchestrator_usage` | 사용 가이드 반환(AI용) |
+| `orchestrator_health` | 서버 상태와 DB 경로 반환 |
+| `session_create` | 세션 생성(초기 메시지 설정 가능) |
+| `session_get` | 세션과 메시지 기록 조회 |
+| `session_list` | 최근 세션 목록 조회 |
+| `session_append` | 기존 세션에 메시지 수동 추가 |
+| `session_delete` | 세션과 관련 메시지 삭제 |
+| `agent_run` | Claude/Codex CLI 실행 후 결과를 세션에 저장 |
+
+## CLI 실행 사양
+
+| Agent | 명령 형식 |
+|---|---|
+| Claude | `claude -p <prompt> [--allowedTools <pattern>]` |
+| Codex | `codex exec --skip-git-repo-check <prompt>` |
+
+- 역할은 `user`와 `assistant`만 사용 가능(`system`은 미지원)
+- `cwd` 미지정 시 `BASE_DIR`에서 실행된다
+
+## 파일 구성
+
+```text
+mcp-orchestration-ai/
+├── README.md
+├── PLANNING.md          # 상세 설계 문서
+├── SKILL.md             # AI용 사용 스킬 정의
+├── .gitignore
+├── data/
+│   └── orchestrator.sqlite  # SQLite DB(자동 생성, .gitignore 대상)
+└── src/
+    └── server.py            # 구현 본체(단일 파일 구성)
+```
+
+## 테스트
+
+```bash
+cd lsm-ai/tools/mcp-orchestration-ai
+python3 -m py_compile src/server.py
+```
+
+## 보안
+
+- Web UI는 로컬 개발용이며 인증 기능이 없다(`127.0.0.1` bind)
+- prompt / message 저장 시 `api_key`, `token`, `secret`, `password`, `Authorization: Bearer` 패턴은 `<redacted>`로 치환한다
+- 기밀 정보의 완전한 탐지는 보장하지 않는다. secret을 prompt에 포함하지 않는 운영을 전제로 한다
+- `claude` / `codex` CLI 인증·MCP 설정·PAT 관리는 서버 외부에서 수행한다
+
+## 상세 설계
+
+아키텍처, SQLite schema, Scheduler 사양, CLI 실행 사양의 상세 내용은 [PLANNING.md](./PLANNING.md)를 참조한다.
+AI가 도구를 사용할 때의 절차·제약은 [SKILL.md](./SKILL.md)를 참조한다.
