@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import anyio
 import base64
 import contextlib
@@ -16,10 +16,6 @@ import subprocess
 import sys
 import threading
 import time
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 이하 호환 분기
-    tomllib = None  # type: ignore[assignment]
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
@@ -37,59 +33,45 @@ from mcp.server.fastmcp import Context, FastMCP
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASE_DIR = Path("D:/work")
-DB_PATH = Path("D:/work/security/orchestrator.sqlite")
-DEFAULT_LOG_DIR = Path("D:/work/nowonbun-orchestration-ai-mcp")
+# BASE_DIR = Path("D:/orchestration")
+# DB_PATH = Path("D:/orchestration/data/orchestrator.sqlite")
+# DEFAULT_LOG_DIR = Path("D:/orchestration/log")
+BASE_DIR = Path("D:/orchestration")
+DB_PATH = Path("D:/orchestration/data/orchestrator.sqlite")
+DEFAULT_LOG_DIR = Path("D:/orchestration/log")
 DEFAULT_TIMEOUT_MS = 300000  # 기본 하드 타임아웃(300초)
-DEFAULT_IDLE_TIMEOUT_SEC = 300  # 출력이 없을 때의 idle 타임아웃(초)
-DEFAULT_ALIVE_LOG_INTERVAL_SEC = 30  # 실행 중 상태 로그 출력 간격(초)
-AGENT_RUN_PROGRESS_INTERVAL_SEC = 30  # MCP client timeout 防止用 progress heartbeat 間隔（秒）
-COMPLETED_RUN_CACHE_SIZE = 100  # 완료된 agent_run 결과의 메모리 보관 상한
-COMPLETED_RUN_TTL_SEC = 300  # 완료된 agent_run 결과의 보관 초 수
+DEFAULT_IDLE_TIMEOUT_SEC = 300  # 출력이 없을 경우의 유휴 타임아웃(초)
+DEFAULT_ALIVE_LOG_INTERVAL_SEC = 30  # 실행 중 활성 로그 출력 간격(초)
+AGENT_RUN_PROGRESS_INTERVAL_SEC = 30  # MCP client timeout 방지용 progress heartbeat 간격(초)
+COMPLETED_RUN_CACHE_SIZE = 100  # 완료된 agent_run 결과의 메모리 보유 상한
+COMPLETED_RUN_TTL_SEC = 300  # 완료된 agent_run 결과의 보유 초수
 DEFAULT_GRACEFUL_SHUTDOWN_SEC = 5
 
-# export를 사용하지 않는 로컬 운영용 기본값입니다.
-# 환경 변수가 설정되어 있으면 환경 변수를 우선하고, 미설정일 때만 아래 기본값을 사용합니다.
+# export를 사용하지 않는 로컬 운용 전용 소스 정의값.
+# 환경변수가 설정되어 있으면 환경변수를 우선하고, 미설정 시에만 아래 정의값을 사용한다.
 #
 # 사용 방법:
-# - 이 블록은 batch 실행이나 상주 서버 실행 때 매번 export 하고 싶지 않을 경우 수정합니다.
-# - 기본값을 변경한 뒤에는 실행 중인 mcp-orchestration-ai 서버를 재시작합니다.
-# - MCP tool 허용·승인 설정은 DEFAULT_TOOL_APPROVALS에 모읍니다.
-# - Claude 허용 tool은 Claude CLI의 tool 이름으로 나열합니다.
-# - Codex 승인 tool은 "server.tool" 형식으로 read/범용 tool과 write tool을 분리해 나열합니다.
-# - Codex에서 전체 tool을 승인할 경우 allow_broad_patterns=True 상태에서 "*" 또는 "server.*"를 사용합니다.
-# - "*"는 Codex config.toml에 정의된 MCP server 목록에서 "server.*"로 확장됩니다.
-# - 외부 공유 상태를 변경하는 write tool은 write 전용 목록으로 분리합니다.
-# - approve_mcp_writes=True 일 때만 활성화합니다.
-# - "*", "mcp__*", "server.*" 같은 광범위 허용은 allow_broad_patterns=True일 때만 허용합니다.
-# - 일반적으로는 개별 tool 이름 나열을 우선합니다.
-# - skipPermissions는 UI/API의 명시 지정으로만 사용하며 Claude의 로컬 권한 확인을 우회합니다.
-# - 비대화형 batch에서는 필수 값이 부족하거나 모호하면 실행하지 않고 blocked 처리합니다.
+# - 이 블록은 batch 실행이나 상주 서버 시작 시 매번 export하고 싶지 않을 때 편집한다.
+# - 정의값을 변경한 후에는 가동 중인 mcp-orchestration-ai 서버를 재시작한다.
+# - MCP tool 허가는 DEFAULT_TOOL_APPROVALS에 모은다.
+# - Claude의 허가 tool은 Claude CLI의 tool 이름(예: mcp__server__tool)으로 나열한다.
+# - Codex는 추가 CLI 옵션 없이 실행하며, MCP tool 사전승인이나 add-dir은 부여하지 않는다.
+# - "*", "mcp__*", "server.*" 같은 광범위 허가는 allow_broad_patterns=True일 때만 허용된다.
+#   통상적으로는 개별 tool 이름의 나열을 우선한다.
+# - Claude는 항상 --dangerously-skip-permissions를 부여한다.
+# - 비대화 batch에서는 확인 질문을 하지 않으며, target/action/content가 부족하거나 모호할 경우 실행하지 않고 blocked로 처리한다.
 #
-# 예시:
-# - Claude에서 read 계열 MCP tool만 허용:
+# 예:
+# - Claude에서 read 계열 MCP tool만 허가하는 경우:
 #   DEFAULT_TOOL_APPROVALS["claude_allowed_tools"] = ("mcp__my_server__read_item",)
-# - Codex에서 read/범용 MCP tool을 사전 승인:
-#   DEFAULT_TOOL_APPROVALS["codex_approved_tools"] = ("my-server.read_item",)
-# - Codex에서 write 계열 MCP tool을 명시 opt-in으로 사전 승인:
-#   DEFAULT_TOOL_APPROVALS["codex_approved_write_tools"] = ("my-server.create_item",)
-#   DEFAULT_TOOL_APPROVALS["approve_mcp_writes"] = True
-# - Codex에서 설정된 MCP server의 전체 tool을 사전 승인:
-#   DEFAULT_TOOL_APPROVALS["codex_approved_tools"] = ("*",)
-#   DEFAULT_TOOL_APPROVALS["codex_approved_write_tools"] = ("*",)
-#   DEFAULT_TOOL_APPROVALS["allow_broad_patterns"] = True
-#   DEFAULT_TOOL_APPROVALS["approve_mcp_writes"] = True
-# - batch 전용 환경에서 Claude 권한 확인을 생략할 경우 schedule의 Skip Permissions를 활성화합니다.
-# - 광범위 pattern을 꼭 사용해야 하는 경우:
+# - Codex의 CLI 옵션은 이 블록에서 제어하지 않는다.
+# - 광범위 pattern을 부득이하게 사용하는 경우:
 #   DEFAULT_TOOL_APPROVALS["allow_broad_patterns"] = True
 #   DEFAULT_TOOL_APPROVALS["claude_allowed_tools"] = ("mcp__my_server__*",)
-# - 어느 예시든 변경 후에는 mcp-orchestration-ai 서버 재시작이 필요합니다.
+# - 모든 예시에서, 변경 후에는 mcp-orchestration-ai 서버의 재시작이 필요하다.
 DEFAULT_TOOL_APPROVALS: dict[str, Any] = {
     "claude_allowed_tools": ("*",),
-    "codex_approved_tools": ("*",),
-    "codex_approved_write_tools": ("*",),
     "allow_broad_patterns": True,
-    "approve_mcp_writes": True,
 }
 LOG_FILE_TIMEZONE = timezone(timedelta(hours=9))
 BATCH_PROMPT_PREFIX = """Batch non-interactive mode.
@@ -98,6 +80,12 @@ Do not ask confirmation questions.
 If the requested MCP write or external write has fully specified target, action, and content, execute it without asking for confirmation.
 If target, action, or content is missing or ambiguous, do not ask a question; stop with BLOCKED|ambiguous-batch-write and state the missing fields.
 If a required MCP tool is unavailable, stop with BLOCKED|tool-unavailable and state the missing tool.
+For write operations, treat only explicitly requested fields as required.
+Do not invent additional required fields, recipients, formats, mentions, labels, metadata, confirmations, or routing rules.
+If target, action, and content are sufficient for the requested tool call, execute the write as-is.
+If optional details are omitted, use the plain/default form of the requested action.
+Block with BLOCKED|ambiguous-batch-write only when an explicitly required target, action, or content field is missing or when multiple materially different executions are possible from the user's request.
+Do not block merely because optional enrichment could be added.
 After any MCP write, report target, action, result, failure reason, and retry necessity.
 This prefix is always applied to scheduled batch runs."""
 
@@ -121,22 +109,8 @@ WORKFLOW_ALLOWED_STAGES = {
 }
 WORKFLOW_ALLOWED_ROLES = {"main", "sub", "planner", "executor", "reviewer", "agent", "system"}
 
-_BLOCKED_EXTRA_ARGS: frozenset[str] = frozenset({
-    "-p", "--print",
-    "--allowedTools", "--allowed-tools",
-    "--dangerously-skip-permissions",
-    "-s", "--sandbox",
-    "-a", "--ask-for-approval",
-    "--add-dir",
-    "--dangerously-bypass-approvals-and-sandbox",
-})
-_CODEX_SANDBOX_MODES: frozenset[str] = frozenset({"read-only", "workspace-write"})
-_CODEX_APPROVAL_POLICIES: frozenset[str] = frozenset({"untrusted", "on-failure", "on-request", "never"})
-CODEX_DEFAULT_ADD_DIRS: tuple[Path, ...] = (
-    Path("/Users/soonyub.hwang/desk/DailyWork").resolve(),
-)
 FILEPATH_PROTECTED_ROOTS: tuple[Path, ...] = (
-    Path("/Users/soonyub.hwang/desk/security").resolve(),
+    Path("C:/Windows").resolve(),
 )
 
 # ---------------------------------------------------------------------------
@@ -154,7 +128,7 @@ _log_file_lock = threading.Lock()
 _log_file_warning_emitted = False
 _workflow_hash_salt = secrets.token_bytes(32)
 
-# 실행 중 에이전트 상태 추적 레지스트리
+# 실행 중 에이전트의 상태 추적 레지스트리
 _active_runs: dict[str, dict[str, Any]] = {}
 _completed_runs: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _active_runs_lock = threading.Lock()
@@ -168,12 +142,26 @@ _ACTIVE_RUN_OBSERVABILITY_NOTE = (
 # ---------------------------------------------------------------------------
 
 def _now_iso() -> str:
-    """현재 시각을 UTC ISO 8601 문자열로 반환합니다."""
+    """현재 시각을 UTC ISO 8601 문자열로 반환한다."""
     return datetime.now(timezone.utc).isoformat()
 
 
+def _format_kst(value: Any) -> str:
+    """UTC/ISO 8601 형식의 시각 값을 한국 시간 표시 문자열로 변환한다."""
+    if value is None or value == "":
+        return ""
+    try:
+        text = str(value).strip()
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(LOG_FILE_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S KST")
+    except Exception:
+        return str(value)
+
+
 def _env_flag(name: str, default: bool) -> bool:
-    """환경 변수를 불리언으로 해석하고 기본값을 반영합니다."""
+    """환경변수를 불리언으로 해석하고, 미설정 시 기본값을 반환한다."""
     raw = os.getenv(name)
     if raw is None:
         return default
@@ -181,7 +169,7 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def _safe_json(value: Any) -> str:
-    """임의 값을 안전한 JSON 문자열로 변환합니다."""
+    """임의의 값을 로그 출력용으로 안전한 JSON 문자열로 변환한다."""
     try:
         return json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
@@ -189,14 +177,14 @@ def _safe_json(value: Any) -> str:
 
 
 def _json_dumps_for_db(value: Any) -> str | None:
-    """DB 저장용 JSON 문자열로 변환한다. None은 NULL로 유지한다."""
+    """DB 저장용 JSON 문자열로 변환한다. None은 NULL로 처리한다."""
     if value is None:
         return None
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def _json_loads_from_db(value: str | None) -> Any:
-    """DB에서 읽은 JSON 문자열을 파이썬 값으로 되돌린다."""
+    """DB에서 읽은 JSON 문자열을 Python 값으로 되돌린다."""
     if value is None or value == "":
         return None
     try:
@@ -206,12 +194,12 @@ def _json_loads_from_db(value: str | None) -> Any:
 
 
 def _workflow_prompt_hash(prompt: str) -> str:
-    """원문 프롬프트 저장 대신 salt가 적용된 해시만 생성한다."""
+    """raw prompt를 저장하지 않고, 프로세스 내 salt 포함 HMAC-SHA256만 생성한다."""
     return hmac.new(_workflow_hash_salt, prompt.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _normalize_prompt_hash(value: Any) -> str | None:
-    """외부 입력 promptHash를 64자 hex 형식으로만 허용한다."""
+    """외부 지정 promptHash를 SHA-256 형식으로 한정하고, raw prompt 혼입을 방지한다."""
     if value is None:
         return None
     text = str(value).strip().lower()
@@ -221,7 +209,7 @@ def _normalize_prompt_hash(value: Any) -> str | None:
 
 
 def _normalize_workflow_stage(stage: Any) -> str:
-    """workflow stage 값을 검증하고 정규화한다."""
+    """workflow decision의 stage를 검증하고 정규화한다."""
     value = str(stage or "").strip()
     if not value:
         raise ValueError("workflow stage is required")
@@ -231,7 +219,7 @@ def _normalize_workflow_stage(stage: Any) -> str:
 
 
 def _normalize_workflow_role(role: Any) -> str:
-    """workflow role 값을 검증하고 정규화한다."""
+    """workflow decision의 role을 검증하고 정규화한다."""
     value = str(role or "agent").strip()
     if value not in WORKFLOW_ALLOWED_ROLES:
         raise ValueError(f"unsupported workflow role: {value}")
@@ -239,7 +227,7 @@ def _normalize_workflow_role(role: Any) -> str:
 
 
 def _limit_text(value: Any, max_chars: int = 500) -> str | None:
-    """로그/DB 저장용 짧은 텍스트로 제한한다."""
+    """정보 로그용 짧은 텍스트로 정규화한다."""
     if value is None:
         return None
     text = str(value).strip()
@@ -251,19 +239,19 @@ def _limit_text(value: Any, max_chars: int = 500) -> str | None:
 
 
 def _json_response(payload: dict[str, Any]) -> bytes:
-    """사전 payload를 UTF-8 JSON 응답 본문으로 변환합니다."""
+    """딕셔너리 페이로드를 UTF-8 JSON 응답 본문으로 변환한다."""
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def _truncate(text: str, limit: int = 2000) -> str:
-    """긴 문자열을 로그 표시용 길이로 자릅니다."""
+    """긴 문자열을 로그 표시용 상한 길이로 잘라낸다."""
     if len(text) <= limit:
         return text
     return f"{text[:limit]}\n...<truncated {len(text) - limit} chars>"
 
 
 def _is_mcp_tool_cancelled(stdout: str, stderr: str) -> bool:
-    """MCP 도구 호출이 취소되었는지 판단합니다."""
+    """MCP 툴 호출이 사용자 또는 승인 경로에서 취소되었는지 판정한다."""
     combined = f"{stdout}\n{stderr}".lower()
     patterns = (
         "user cancelled mcp tool call",
@@ -274,31 +262,31 @@ def _is_mcp_tool_cancelled(stdout: str, stderr: str) -> bool:
 
 
 def _mcp_tool_cancelled_guidance(agent: str, allowed_tools_pattern: str | None) -> dict[str, Any]:
-    """MCP 도구 취소 시 안전한 다음 조치를 반환합니다."""
+    """MCP 툴 취소 시 안전한 다음 액션을 반환한다."""
     return {
         "summary": "MCP tool call was cancelled before completion.",
         "agent": agent,
         "allowedToolsPattern": allowed_tools_pattern,
         "safeNextActions": [
-            "의도한 MCP 호출이라면 클라이언트 측에서 MCP tool call을 명시적으로 승인한 뒤 다시 실행하세요.",
-            "Claude 실행에서는 allowedToolsPattern 또는 ORCH_CLAUDE_ALLOWED_TOOLS에 대상 MCP 도구 이름이 포함되어 있는지 확인하세요.",
-            "외부 공유 상태를 변경하는 MCP 작업은 승인을 우회하지 말고 사용자 확인 후 명시적인 허용 설정으로 실행하세요.",
+            "의도한 MCP 호출이라면 클라이언트 측에서 MCP tool call을 명시적으로 승인한 후 재실행하세요.",
+            "Claude 실행에서는 allowedToolsPattern 또는 ORCH_CLAUDE_ALLOWED_TOOLS에 대상 MCP 툴 이름이 포함되어 있는지 확인하세요.",
+            "외부 공유 상태를 변경하는 MCP 작업은 승인을 우회하지 않고 사용자 확인 후 명시적 허가 설정으로 실행하세요.",
         ],
     }
 
 
 def _get_log_dir() -> Path:
-    """파일 로그 출력 디렉터리를 반환합니다."""
+    """파일 로그의 출력 디렉토리를 반환한다."""
     return Path(os.getenv("ORCH_LOG_DIR", str(DEFAULT_LOG_DIR))).expanduser().resolve()
 
 
 def _get_log_file_path(now: datetime) -> Path:
-    """일별 로그 파일 경로를 반환합니다."""
+    """yyyyMMdd.log 형식의 로그 파일 경로를 반환한다."""
     return _get_log_dir() / f"{now.astimezone(LOG_FILE_TIMEZONE).strftime('%Y%m%d')}.log"
 
 
 def _append_log_file(line: str, now: datetime) -> None:
-    """로그 한 줄을 일별 로그 파일에 추가합니다."""
+    """stderr에 출력한 로그와 동일한 내용을 일별 파일에 추가한다."""
     global _log_file_warning_emitted
     with _log_file_lock:
         try:
@@ -323,7 +311,7 @@ _CURRENT_LOG_LEVEL: int = _LOG_LEVEL_ORDER.get(
 
 
 def _log(event: str, *, level: str = "INFO", **fields: Any) -> None:
-    """구조화 로그를 stderr와 파일에 기록합니다."""
+    """구조화 로그를 stderr와 일별 로그 파일에 출력한다."""
     if _LOG_LEVEL_ORDER.get(level, 0) < _CURRENT_LOG_LEVEL:
         return
     now = datetime.now(timezone.utc)
@@ -334,17 +322,17 @@ def _log(event: str, *, level: str = "INFO", **fields: Any) -> None:
 
 
 def _log_tool_call(name: str, **arguments: Any) -> None:
-    """도구 호출 시작을 로그에 기록합니다."""
+    """MCP 툴 호출 시작을 로그에 기록한다."""
     _log("tool.request", tool=name, **arguments)
 
 
 def _log_tool_result(name: str, result: Any) -> None:
-    """도구 호출 결과를 로그에 기록합니다."""
+    """MCP 툴 호출 결과를 로그에 기록한다."""
     _log("tool.response", tool=name, result=_truncate(_safe_json(result)))
 
 
 def _serialize_active_run(entry: dict[str, Any], *, now: float) -> dict[str, Any]:
-    """관측 가능한 실행 중 run 상태만 반환합니다."""
+    """실행 중 프로세스의 관측 가능한 I/O 상태만 반환한다."""
     return {
         "runId": entry["runId"],
         "agent": entry["agent"],
@@ -366,7 +354,7 @@ def _serialize_active_run(entry: dict[str, Any], *, now: float) -> dict[str, Any
 
 
 def _prune_completed_runs_locked(now: float | None = None) -> None:
-    """완료된 실행 캐시를 TTL과 최대 개수 기준으로 정리한다."""
+    """완료된 run 캐시를 TTL과 건수 상한으로 정리한다."""
     current = time.monotonic() if now is None else now
     expired = [
         run_id
@@ -380,14 +368,14 @@ def _prune_completed_runs_locked(now: float | None = None) -> None:
 
 
 def _sanitize_completed_result(result: dict[str, Any]) -> dict[str, Any]:
-    """완료 캐시에 저장할 때 과도한 디버그 필드를 제거한다."""
+    """완료된 run 캐시용으로 raw prompt를 포함한 debug 정보를 제외한다."""
     sanitized = dict(result)
     sanitized.pop("compiledPrompt", None)
     return sanitized
 
 
 def _summarize_completed_run(entry: dict[str, Any]) -> dict[str, Any]:
-    """최근 완료 실행 목록용 요약 정보만 만든다."""
+    """runId 미지정 목록용으로 stdout/stderr 본문을 포함하지 않는 완료 run 요약을 반환한다."""
     result = entry.get("result") or {}
     stdout = str(result.get("stdout") or "")
     stderr = str(result.get("stderr") or "")
@@ -406,7 +394,7 @@ def _summarize_completed_run(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def _remember_completed_run(run_id: str, result: dict[str, Any], error: str | None = None) -> None:
-    """완료된 실행 결과를 runId 기준 단기 캐시에 저장한다."""
+    """완료된 agent_run 결과를 runId로 단시간 참조할 수 있도록 저장한다."""
     if not run_id:
         return
     entry = {
@@ -430,7 +418,7 @@ def _register_pending_agent_run(
     cwd: str | None,
     timeout_ms: int,
 ) -> None:
-    """백그라운드 시작 직후 조회 가능한 pending 실행 상태를 등록한다."""
+    """agent_run_start 직후부터 status 조회 가능한 pending 상태를 등록한다."""
     now = time.monotonic()
     idle_timeout_sec = int(os.getenv("ORCH_IDLE_TIMEOUT_SEC", str(DEFAULT_IDLE_TIMEOUT_SEC)))
     alive_log_interval = int(os.getenv("ORCH_ALIVE_LOG_INTERVAL_SEC", str(DEFAULT_ALIVE_LOG_INTERVAL_SEC)))
@@ -454,13 +442,13 @@ def _register_pending_agent_run(
 
 
 def _forget_active_run(run_id: str) -> None:
-    """활성 실행 레지스트리에서 실행 항목을 제거한다."""
+    """예외 종료 시 active registry에서 run을 제거한다."""
     with _active_runs_lock:
         _active_runs.pop(run_id, None)
 
 
 def _snapshot_active_runs(run_id: str | None = None) -> dict[str, Any]:
-    """활성 agent_run 상태를 스냅샷으로 반환합니다."""
+    """활성 agent_run의 상태를 스냅샷으로 반환한다."""
     now = time.monotonic()
     with _active_runs_lock:
         _prune_completed_runs_locked(now)
@@ -524,7 +512,7 @@ def _snapshot_active_runs(run_id: str | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _is_benign_disconnect_exception(exc: BaseException | None) -> bool:
-    """무시 가능한 연결 종료 예외인지 판단합니다."""
+    """무시 가능한 클라이언트 연결 해제 예외인지 판정한다."""
     if exc is None:
         return False
     if isinstance(exc, ConnectionResetError):
@@ -535,11 +523,11 @@ def _is_benign_disconnect_exception(exc: BaseException | None) -> bool:
 
 
 def _install_asyncio_exception_filter(loop: asyncio.AbstractEventLoop) -> None:
-    """asyncio 루프에 연결 종료 예외 필터를 설치합니다."""
+    """asyncio 루프에 연결 해제 예외를 억제하는 예외 핸들러를 설정한다."""
     default_handler = loop.get_exception_handler()
 
     def handler(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
-        """예외 컨텍스트를 분류해 필요한 경우 기본 핸들러로 위임합니다."""
+        """asyncio 예외 컨텍스트를 분류하고, 필요 시 기본 핸들러에 위임한다."""
         exc = context.get("exception")
         if _is_benign_disconnect_exception(exc):
             _log("asyncio.disconnect_ignored", message=context.get("message"), error=str(exc))
@@ -554,9 +542,9 @@ def _install_asyncio_exception_filter(loop: asyncio.AbstractEventLoop) -> None:
 
 if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
     class _WindowsFilteredEventLoopPolicy(asyncio.WindowsProactorEventLoopPolicy):  # type: ignore[attr-defined]
-        """연결 종료 예외 필터가 포함된 Windows event loop 정책입니다."""
+        """Windows 환경에서 연결 해제 예외 필터 포함 event loop를 생성하는 정책."""
         def new_event_loop(self) -> asyncio.AbstractEventLoop:
-            """새 event loop를 만들고 예외 필터를 적용합니다."""
+            """연결 해제 예외 필터를 내장한 새로운 event loop를 생성한다."""
             loop = super().new_event_loop()
             _install_asyncio_exception_filter(loop)
             return loop
@@ -565,7 +553,7 @@ else:
 
 
 def _force_exit(exit_code: int = 130) -> None:
-    """필요한 후처리 후 프로세스를 강제 종료합니다."""
+    """필요한 후처리를 시도한 후 프로세스를 강제 종료한다."""
     _log("process.force_exit", exit_code=exit_code)
     global _connection
     if _connection is not None:
@@ -576,7 +564,7 @@ def _force_exit(exit_code: int = 130) -> None:
 
 
 def _start_shutdown_timer(timeout_sec: int) -> None:
-    """graceful shutdown 상한 시간을 감시하는 타이머를 시작합니다."""
+    """graceful shutdown의 상한 시간을 감시하는 타이머를 시작한다."""
     global _shutdown_timer
     if _shutdown_timer is not None:
         return
@@ -587,7 +575,7 @@ def _start_shutdown_timer(timeout_sec: int) -> None:
 
 
 def _cancel_shutdown_timer() -> None:
-    """시작된 shutdown 타이머를 중지합니다."""
+    """시작된 shutdown 타이머를 정지한다."""
     global _shutdown_timer
     if _shutdown_timer is not None:
         _shutdown_timer.cancel()
@@ -596,12 +584,12 @@ def _cancel_shutdown_timer() -> None:
 
 
 def _install_signal_guards() -> None:
-    """shutdown 시그널 처리 핸들러를 설치합니다."""
+    """SIGINT/SIGTERM 수신 시 단계적 shutdown을 수행하는 핸들러를 설정한다."""
     global _shutdown_signal_count
     timeout_sec = int(os.getenv("ORCH_SHUTDOWN_TIMEOUT_SEC", "5"))
 
     def handle_shutdown(signum: int, _frame: Any) -> None:
-        """shutdown 신호를 단계적으로 처리합니다."""
+        """shutdown 시그널을 처리하며, 초회는 예외 발생, 두 번째 이후는 강제 종료한다."""
         global _shutdown_signal_count
         _shutdown_signal_count += 1
         _log("signal.received", signum=signum, count=_shutdown_signal_count)
@@ -616,7 +604,7 @@ def _install_signal_guards() -> None:
 
 
 def _install_runtime_guards() -> None:
-    """실행 환경에 맞는 런타임 보호 장치를 설치합니다."""
+    """OS와 실행 환경에 따른 런타임 보호를 초기화한다."""
     if os.name == "nt" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
         asyncio.set_event_loop_policy(_WindowsFilteredEventLoopPolicy())
         _log("asyncio.policy_installed", policy="WindowsFilteredEventLoopPolicy")
@@ -624,7 +612,7 @@ def _install_runtime_guards() -> None:
 
 
 def _configure_console_utf8() -> None:
-    """표준 입출력 스트림을 UTF-8로 재설정합니다."""
+    """표준 입출력 스트림을 UTF-8로 취급하도록 재설정한다."""
     for stream_name in ("stdin", "stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         reconfigure = getattr(stream, "reconfigure", None)
@@ -641,7 +629,7 @@ def _configure_console_utf8() -> None:
 # ---------------------------------------------------------------------------
 
 def _decode_base64_text(value: str, *, field_name: str) -> str:
-    """Base64 문자열을 UTF-8 텍스트로 복호화합니다."""
+    """Base64 문자열을 UTF-8 텍스트로 디코딩한다."""
     try:
         return base64.b64decode(value).decode("utf-8")
     except Exception as exc:
@@ -649,7 +637,7 @@ def _decode_base64_text(value: str, *, field_name: str) -> str:
 
 
 def _resolve_text_value(raw: Any, raw_base64: Any, *, field_name: str) -> str:
-    """일반 텍스트와 Base64 입력의 우선순위를 정해 반환합니다."""
+    """일반 텍스트와 Base64 입력의 우선순위를 해결하여 문자열을 반환한다."""
     if raw_base64 not in (None, ""):
         return _decode_base64_text(str(raw_base64), field_name=field_name)
     if raw in (None, ""):
@@ -657,8 +645,13 @@ def _resolve_text_value(raw: Any, raw_base64: Any, *, field_name: str) -> str:
     return str(raw)
 
 
+def _ignored_legacy_agent_option_names(**options: Any) -> list[str]:
+    """호환용으로 수신하지만 내부 실행에 전달하지 않는 agent 옵션명을 반환한다."""
+    return [name for name, value in options.items() if bool(value)]
+
+
 def normalize_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, str]]:
-    """입력 메시지를 role/content 기준으로 정규화합니다."""
+    """MCP 입력 메시지를 role/content 정규화된 배열로 변환한다."""
     if messages is None:
         return []
     if not isinstance(messages, list):
@@ -697,7 +690,7 @@ def _split_messages(
 
 
 def _format_prior(prior: list[dict[str, str]], labels: dict[str, str]) -> list[str]:
-    """과거 대화 메시지를 프롬프트용 라벨 텍스트로 정리합니다."""
+    """과거 대화 메시지를 프롬프트용 레이블 행으로 정형한다."""
     lines: list[str] = []
     for m in prior:
         label = labels.get(m["role"])
@@ -714,7 +707,7 @@ def compile_claude_parts(messages: list[dict[str, Any]] | None) -> str:
 
     prior, last_user = _split_messages(normalized)
 
-    user_parts = _format_prior(prior, {"user": "[이전 질문]", "assistant": "[이전 답변]", "tool": "[도구 결과]"})
+    user_parts = _format_prior(prior, {"user": "[이전 질문]", "assistant": "[이전 응답]", "tool": "[도구 결과]"})
     if user_parts:
         user_parts.append("")
     user_parts.append(last_user)
@@ -723,7 +716,7 @@ def compile_claude_parts(messages: list[dict[str, Any]] | None) -> str:
 
 
 def build_batch_prompt(prompt: str) -> str:
-    """비대화형 batch 실행용 프롬프트를 구성합니다."""
+    """비대화 batch 실행용 확인 질문 금지 프롬프트를 부여한다."""
     return f"{BATCH_PROMPT_PREFIX}\n\n{prompt}".strip()
 
 
@@ -751,7 +744,7 @@ def compile_codex_prompt(messages: list[dict[str, Any]] | None) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve_cli_command(name: str) -> str:
-    """CLI 명령 이름을 실행 가능한 경로로 해석합니다."""
+    """CLI 명령어 이름을 실행 가능 경로로 해결한다."""
     direct = shutil.which(name)
     if direct:
         return direct
@@ -773,15 +766,9 @@ def _resolve_cli_command(name: str) -> str:
     return name
 
 
-def _validate_extra_args(args: list[str]) -> None:
-    """사용자 지정 extraArgs에 금지된 CLI 인수가 없는지 검증합니다."""
-    for arg in args:
-        if arg.split("=")[0] in _BLOCKED_EXTRA_ARGS:
-            raise ValueError(f"extra_args contains blocked argument: {arg!r}")
-
 
 def _split_tool_patterns(raw: str | None) -> list[str]:
-    """도구 패턴 문자열을 분리합니다."""
+    """도구 지정 문자열을 쉼표/공백 구분으로 분할한다."""
     if raw is None:
         return []
     normalized = raw.replace(",", " ")
@@ -789,12 +776,12 @@ def _split_tool_patterns(raw: str | None) -> list[str]:
 
 
 def _has_broad_tool_pattern(patterns: list[str]) -> bool:
-    """광범위 도구 허용 패턴 포함 여부를 확인합니다."""
+    """광범위한 도구 허가 패턴을 감지한다."""
     return any(pattern in {"*", "mcp__*"} or pattern.endswith(".*") for pattern in patterns)
 
 
 def _validate_tool_patterns(patterns: list[str], *, allow_broad_env: str) -> None:
-    """허용되지 않은 광범위 도구 패턴을 차단합니다."""
+    """위험한 광범위 허가를 명시적 opt-in 없이 거부한다."""
     if _has_broad_tool_pattern(patterns) and not _env_flag(
         allow_broad_env,
         bool(DEFAULT_TOOL_APPROVALS["allow_broad_patterns"]),
@@ -803,7 +790,7 @@ def _validate_tool_patterns(patterns: list[str], *, allow_broad_env: str) -> Non
 
 
 def _get_default_claude_allowed_tools() -> list[str]:
-    """기본 Claude 허용 도구 목록을 반환합니다."""
+    """비대화 실행에서 사전 허가하는 Claude tool 패턴을 가져온다."""
     raw = os.getenv("ORCH_CLAUDE_ALLOWED_TOOLS")
     if raw is not None:
         patterns = _split_tool_patterns(raw)
@@ -814,7 +801,7 @@ def _get_default_claude_allowed_tools() -> list[str]:
 
 
 def _resolve_claude_allowed_tools(allowed_tools_pattern: str | None) -> str | None:
-    """Claude에 전달할 허용 도구 패턴을 정리합니다."""
+    """Claude -p 비대화 실행에서 명시된 도구 허가만 부여한다."""
     requested = _split_tool_patterns(allowed_tools_pattern)
     _validate_tool_patterns(requested, allow_broad_env="ORCH_ALLOW_BROAD_TOOL_PATTERNS")
     defaults = _get_default_claude_allowed_tools()
@@ -830,170 +817,11 @@ def _resolve_claude_allowed_tools(allowed_tools_pattern: str | None) -> str | No
     return ",".join(merged)
 
 
-def _get_codex_sandbox_mode() -> str:
-    """Codex sandbox 모드를 반환합니다."""
-    value = os.getenv("ORCH_CODEX_SANDBOX", "workspace-write").strip()
-    if value not in _CODEX_SANDBOX_MODES:
-        raise ValueError(f"unsupported ORCH_CODEX_SANDBOX: {value!r}")
-    return value
 
-
-def _get_codex_approval_policy() -> str:
-    """Codex approval policy를 반환합니다."""
-    value = os.getenv("ORCH_CODEX_APPROVAL_POLICY", "on-request").strip()
-    if value not in _CODEX_APPROVAL_POLICIES:
-        raise ValueError(f"unsupported ORCH_CODEX_APPROVAL_POLICY: {value!r}")
-    return value
-
-
-def _get_default_codex_mcp_approved_tools() -> list[str]:
-    """기본 Codex MCP 승인 도구 목록을 반환합니다."""
-    raw = os.getenv("ORCH_CODEX_MCP_APPROVED_TOOLS")
-    if raw is not None:
-        return _split_tool_patterns(raw)
-    return list(DEFAULT_TOOL_APPROVALS["codex_approved_tools"])
-
-
-def _get_default_codex_mcp_approved_write_tools() -> list[str]:
-    """기본 Codex MCP write 승인 도구 목록을 반환합니다."""
-    raw = os.getenv("ORCH_CODEX_MCP_APPROVED_WRITE_TOOLS")
-    if raw is not None:
-        return _split_tool_patterns(raw)
-    return list(DEFAULT_TOOL_APPROVALS["codex_approved_write_tools"])
-
-
-def _get_codex_config_path() -> Path:
-    """Codex 설정 파일 경로를 반환합니다."""
-    explicit = os.getenv("ORCH_CODEX_CONFIG_PATH") or os.getenv("CODEX_CONFIG_PATH")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-
-    codex_home = os.getenv("CODEX_HOME")
-    if codex_home:
-        return (Path(codex_home).expanduser() / "config.toml").resolve()
-    return (Path.home() / ".codex" / "config.toml").resolve()
-
-
-def _load_codex_mcp_server_names() -> list[str]:
-    """Codex 설정에서 MCP 서버 이름 목록을 읽습니다."""
-    if tomllib is None:
-        raise ValueError("Codex MCP wildcard '*' requires Python 3.11+ tomllib or explicit server.* entries")
-
-    config_path = _get_codex_config_path()
-    if not config_path.exists():
-        raise ValueError(f"Codex config not found for MCP wildcard expansion: {config_path}")
-    if not config_path.is_file():
-        raise ValueError(f"Codex config path is not a file: {config_path}")
-
-    with config_path.open("rb") as handle:
-        data = tomllib.load(handle)
-
-    mcp_servers = data.get("mcp_servers", {})
-    if not isinstance(mcp_servers, dict):
-        raise ValueError("Codex config mcp_servers must be a table for wildcard expansion")
-
-    server_names = sorted(str(name) for name, value in mcp_servers.items() if isinstance(value, dict))
-    if not server_names:
-        raise ValueError("Codex MCP wildcard '*' found no configured mcp_servers")
-    return server_names
-
-
-def _normalize_codex_mcp_tool_refs(tool_refs: list[str] | None) -> list[str]:
-    """Codex MCP 도구 참조를 server.tool 형식으로 검증/정규화한다."""
-    patterns = [str(tool_ref).strip() for tool_ref in (tool_refs or []) if str(tool_ref).strip()]
-    _validate_tool_patterns(patterns, allow_broad_env="ORCH_ALLOW_BROAD_TOOL_PATTERNS")
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for tool_ref in patterns:
-        if tool_ref == "*":
-            # Codex는 mcp_servers.*.tools.* 를 strict-config로 받지 않으므로,
-            # 설정된 server별 server.* 형태로 확장합니다.
-            candidates = [f"{server_name}.*" for server_name in _load_codex_mcp_server_names()]
-        else:
-            candidates = [tool_ref]
-
-        for candidate in candidates:
-            if "." not in candidate:
-                raise ValueError(f"invalid Codex MCP tool reference: {candidate!r}")
-            server_name, tool_name = candidate.split(".", 1)
-            if not server_name or not tool_name:
-                raise ValueError(f"invalid Codex MCP tool reference: {candidate!r}")
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            normalized.append(candidate)
-    return normalized
-
-
-def _codex_mcp_writes_enabled(approve_writes: bool) -> bool:
-    """Codex MCP write 사전 승인이 활성인지 판단합니다."""
-    return approve_writes or _env_flag(
-        "ORCH_CODEX_APPROVE_MCP_WRITES",
-        bool(DEFAULT_TOOL_APPROVALS["approve_mcp_writes"]),
-    )
-
-
-def _collect_codex_mcp_tool_refs(
-    approved_tools: list[str] | None = None,
-    approved_write_tools: list[str] | None = None,
-    *,
-    approve_writes: bool = False,
-) -> list[str]:
-    """승인 대상 Codex MCP 도구 참조를 수집합니다."""
-    tool_refs = [
-        *_get_default_codex_mcp_approved_tools(),
-        *(approved_tools or []),
-    ]
-    if _codex_mcp_writes_enabled(approve_writes):
-        tool_refs.extend(_get_default_codex_mcp_approved_write_tools())
-        tool_refs.extend(approved_write_tools or [])
-    elif approved_write_tools:
-        raise ValueError("codex MCP write tool approval requires approveCodexMcpWrites=true")
-    return tool_refs
-
-
-def _codex_mcp_tool_ref_to_config_arg(tool_ref: str) -> list[str]:
-    """server.tool 형식을 Codex config override 인수로 변환한다."""
-    server_name, tool_name = tool_ref.split(".", 1)
-    key = f"mcp_servers.{server_name}.tools.{tool_name}.approval_mode"
-    return ["-c", f'{key}="approve"']
-
-
-def _build_codex_mcp_approval_config_args(
-    approved_tools: list[str] | None = None,
-    approved_write_tools: list[str] | None = None,
-    *,
-    approve_writes: bool = False,
-) -> list[str]:
-    """Codex 실행 시 MCP 사전 승인용 config override 인수를 구성한다."""
-    tool_refs = _collect_codex_mcp_tool_refs(
-        approved_tools, approved_write_tools, approve_writes=approve_writes,
-    )
-    args: list[str] = []
-    for tool_ref in _normalize_codex_mcp_tool_refs(tool_refs):
-        args.extend(_codex_mcp_tool_ref_to_config_arg(tool_ref))
-    return args
-
-
-def _get_codex_add_dirs() -> list[str]:
-    """Codex에 추가 writable 디렉터리 목록을 반환합니다."""
-    add_dirs: list[str] = []
-    seen: set[Path] = set()
-    for candidate in CODEX_DEFAULT_ADD_DIRS:
-        resolved = candidate.resolve()
-        if not resolved.exists():
-            raise ValueError(f"Codex add-dir target not found: {resolved}")
-        if not resolved.is_dir():
-            raise ValueError(f"Codex add-dir target is not a directory: {resolved}")
-        if resolved not in seen:
-            seen.add(resolved)
-            add_dirs.append(str(resolved))
-    return add_dirs
 
 
 def _normalize_injected_file_paths(file_paths: list[str] | None) -> list[str]:
-    """filePaths 입력을 문자열 배열로 정규화합니다."""
+    """filePaths 입력을 빈 요소 없는 문자열 배열로 정규화한다."""
     if file_paths is None:
         return []
     if not isinstance(file_paths, list):
@@ -1008,7 +836,7 @@ def _normalize_injected_file_paths(file_paths: list[str] | None) -> list[str]:
 
 
 def _resolve_injected_file_path(raw_path: str, *, base_dir: Path) -> Path:
-    """주입 대상 파일 경로를 절대 경로로 해석합니다."""
+    """filePaths의 상대 경로를 실행 cwd 기준 절대 경로로 해결한다."""
     candidate = Path(raw_path)
     if not candidate.is_absolute():
         candidate = base_dir / candidate
@@ -1016,7 +844,7 @@ def _resolve_injected_file_path(raw_path: str, *, base_dir: Path) -> Path:
 
 
 def _is_protected_file_path(path: Path) -> bool:
-    """보호 경로 하위인지 확인합니다."""
+    """프롬프트 인젝션으로 읽어서는 안 되는 보호 루트 하위인지 판정한다."""
     for protected_root in FILEPATH_PROTECTED_ROOTS:
         try:
             path.relative_to(protected_root)
@@ -1032,7 +860,7 @@ def _read_files_for_prompt(
     base_dir: Path,
     char_limit_per_file: int = 12000,
 ) -> str:
-    """지정 파일을 읽어 프롬프트 주입용 섹션으로 구성합니다."""
+    """지정 파일을 읽어들여 프롬프트 인젝션용 섹션으로 정형한다."""
     if not file_paths:
         return ""
 
@@ -1059,42 +887,19 @@ def _build_claude_command(
     allowed_tools_pattern: str | None,
     extra_args: list[str],
 ) -> list[str]:
-    """Claude CLI 명령을 구성합니다."""
+    """Claude CLI 커맨드를 구축한다."""
     command = [_resolve_cli_command("claude"), "-p", prompt]
     effective_allowed_tools = _resolve_claude_allowed_tools(allowed_tools_pattern)
     if effective_allowed_tools:
         command.extend(["--allowedTools", effective_allowed_tools])
-    command.extend(extra_args)
+    command.append("--dangerously-skip-permissions")
+    command.extend(arg for arg in extra_args if arg != "--dangerously-skip-permissions")
     return command
 
 
-def _build_codex_command(
-    prompt: str,
-    extra_args: list[str],
-    codex_mcp_approved_tools: list[str] | None = None,
-    codex_mcp_approved_write_tools: list[str] | None = None,
-    approve_codex_mcp_writes: bool = False,
-) -> list[str]:
-    """Codex CLI 명령을 구성합니다."""
-    command = [
-        _resolve_cli_command("codex"),
-        *_build_codex_mcp_approval_config_args(
-            codex_mcp_approved_tools,
-            codex_mcp_approved_write_tools,
-            approve_writes=approve_codex_mcp_writes,
-        ),
-        "--sandbox",
-        _get_codex_sandbox_mode(),
-        "--ask-for-approval",
-        _get_codex_approval_policy(),
-        "exec",
-        "--skip-git-repo-check",
-    ]
-    for add_dir in _get_codex_add_dirs():
-        command.extend(["--add-dir", add_dir])
-    command.extend(extra_args)
-    command.append(prompt)
-    return command
+def _build_codex_command(prompt: str) -> list[str]:
+    """Codex CLI 커맨드를 구축한다. --skip-git-repo-check를 항상 부여한다."""
+    return [_resolve_cli_command("codex"), "exec", "--skip-git-repo-check", prompt]
 
 
 def _build_command(
@@ -1102,26 +907,13 @@ def _build_command(
     prompt: str,
     allowed_tools_pattern: str | None,
     extra_args: list[str],
-    codex_mcp_approved_tools: list[str] | None = None,
-    codex_mcp_approved_write_tools: list[str] | None = None,
-    approve_codex_mcp_writes: bool = False,
-    *,
-    _internal: bool = False,
 ) -> list[str]:
-    """에이전트 종류에 맞는 전체 CLI 명령을 구성합니다."""
-    if not _internal:
-        _validate_extra_args(extra_args)
-
+    """지정 agent에 따른 CLI 커맨드 전체를 구축한다."""
     if agent == "claude":
         return _build_claude_command(prompt, allowed_tools_pattern, extra_args)
 
     if agent == "codex":
-        return _build_codex_command(
-            prompt, extra_args,
-            codex_mcp_approved_tools,
-            codex_mcp_approved_write_tools,
-            approve_codex_mcp_writes,
-        )
+        return _build_codex_command(prompt)
 
     raise ValueError(f"unsupported agent: {agent}")
 
@@ -1134,23 +926,15 @@ def run_agent_cli(
     timeout_ms: int,
     allowed_tools_pattern: str | None,
     extra_args: list[str],
-    codex_mcp_approved_tools: list[str] | None = None,
-    codex_mcp_approved_write_tools: list[str] | None = None,
-    approve_codex_mcp_writes: bool = False,
     run_id: str | None = None,
     session_id: str | None = None,
-    _internal: bool = False,
 ) -> dict[str, Any]:
-    """CLI 프로세스를 실행하고 출력·상태·타임아웃을 관리합니다."""
+    """Claude/Codex CLI 프로세스를 시작하고, 출력/타임아웃/상태를 관리한다."""
     command = _build_command(
         agent,
         prompt,
         allowed_tools_pattern,
         extra_args,
-        codex_mcp_approved_tools,
-        codex_mcp_approved_write_tools,
-        approve_codex_mcp_writes,
-        _internal=_internal,
     )
     working_directory = str(Path(cwd).resolve()) if cwd else None
     _log("cli.request", agent=agent, cwd=working_directory, timeout_ms=timeout_ms,
@@ -1195,23 +979,23 @@ def run_agent_cli(
             }
 
     def _touch_activity() -> None:
-        """마지막 활동 시각을 갱신합니다."""
+        """CLI 출력의 최종 활동 시각을 갱신한다."""
         nonlocal last_activity
         with _activity_lock:
             last_activity = time.monotonic()
 
     def _seconds_since_activity() -> float:
-        """마지막 활동 이후 경과 시간을 반환합니다."""
+        """CLI 출력의 최종 활동 이후 경과 초수를 반환한다."""
         with _activity_lock:
             return time.monotonic() - last_activity
 
     def consume(stream: Any, buffer: list[str], label: str) -> None:
-        """출력 스트림을 읽어 버퍼와 활동 상태를 갱신합니다."""
+        """stdout/stderr 스트림을 읽어, 출력 버퍼와 활동 상태를 갱신한다."""
         try:
             for line in iter(stream.readline, ""):
                 buffer.append(line)
                 _touch_activity()
-                # 레지스트리 카운터 갱신
+                # 레지스트리의 카운터 갱신
                 if run_id is not None:
                     with _active_runs_lock:
                         entry = _active_runs.get(run_id)
@@ -1228,7 +1012,7 @@ def run_agent_cli(
     stdout_thread.start()
     stderr_thread.start()
 
-    # 활동도 기반 타임아웃: 하드 타임아웃 안에서 idle 여부를 판정
+    # 활성도 기반 타임아웃: 하드 타임아웃 내에서 유휴 판정을 수행
     hard_deadline = time.monotonic() + (timeout_ms / 1000)
     last_alive_log = time.monotonic()
 
@@ -1246,7 +1030,7 @@ def run_agent_cli(
             idle_sec = _seconds_since_activity()
             elapsed_sec = now - (hard_deadline - timeout_ms / 1000)
 
-            # 주기적으로 상태 로그 출력
+            # 주기적으로 활성 로그 출력
             if now - last_alive_log >= alive_log_interval:
                 _log("cli.alive", agent=agent,
                      elapsed_sec=round(elapsed_sec, 1),
@@ -1255,7 +1039,7 @@ def run_agent_cli(
                      stderr_lines=len(stderr_chunks))
                 last_alive_log = now
 
-            # idle 타임아웃: 일정 시간 출력이 없을 때
+            # 유휴 타임아웃: 출력이 일정 기간 없는 경우
             if idle_sec >= idle_timeout_sec:
                 timed_out = True
                 timeout_reason = f"idle for {idle_sec:.0f}s (no output)"
@@ -1315,21 +1099,21 @@ def run_agent_cli(
 # Cron schedule helpers
 # ---------------------------------------------------------------------------
 
-# 수동 실행 전용을 나타내는 센티널 값입니다. 6필드 형식(초를 포함한 cron 관례 표기)입니다.
-# _parse_cron(5필드)에 도달하기 전에 _is_manual_only_cron()에서 가드됩니다.
+# 수동 실행 전용을 나타내는 센티넬 값. 6필드 형식(초를 포함하는 cron 관례에 맞춘 표기).
+# _parse_cron(5필드)에 도달하기 전에 _is_manual_only_cron()으로 가드된다.
 _MANUAL_ONLY_CRON = "- - - - - -"
 
 _CRON_FIELD_RANGES: tuple[tuple[int, int], ...] = (
-    (0, 59),   # 分
-    (0, 23),   # 時
-    (1, 31),   # 日
-    (1, 12),   # 月
-    (0, 6),    # 曜日（月曜=0）
+    (0, 59),   # 분
+    (0, 23),   # 시
+    (1, 31),   # 일
+    (1, 12),   # 월
+    (0, 6),    # 요일(월요=0)
 )
 
 
 def _parse_cron_field(field: str, minimum: int, maximum: int) -> set[int]:
-    """cron 단일 필드를 허용 값 집합으로 확장합니다."""
+    """cron의 단일 필드를 허용값 집합으로 전개한다."""
     values: set[int] = set()
     for part in field.split(","):
         part = part.strip()
@@ -1357,7 +1141,7 @@ def _parse_cron_field(field: str, minimum: int, maximum: int) -> set[int]:
 
 
 def _parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[int]]:
-    """cron 식을 분·시·일·월·요일 값 집합으로 해석합니다."""
+    """cron 식을 분/시/일/월/요일의 값 집합으로 해석한다."""
     fields = expr.strip().split()
     if len(fields) != 5:
         raise ValueError("cron expression must have 5 fields")
@@ -1369,7 +1153,7 @@ def _parse_cron(expr: str) -> tuple[set[int], set[int], set[int], set[int], set[
 
 
 def _is_manual_only_cron(expr: str) -> bool:
-    """수동 실행 전용 cron 표현식인지 판단합니다."""
+    """수동 실행 전용의 cron 표현식인지 판정한다."""
     stripped = expr.strip()
     if not stripped:
         return False
@@ -1377,12 +1161,12 @@ def _is_manual_only_cron(expr: str) -> bool:
 
 
 def _is_manual_only_prompt(prompt: str) -> bool:
-    """프롬프트에 수동 실행 전용 마커가 있는지 판단합니다."""
+    """프롬프트 내의 수동 실행 전용 마커를 판정한다."""
     return _MANUAL_ONLY_CRON in prompt
 
 
 def _cron_matches(expr: str, candidate_utc: datetime) -> bool:
-    """지정 시각이 cron 조건과 일치하는지 확인합니다."""
+    """지정 일시가 해석 완료된 cron 조건에 일치하는지 판정한다."""
     if _is_manual_only_cron(expr):
         return False
     minute, hour, day, month, weekday = _parse_cron(expr)
@@ -1397,7 +1181,7 @@ def _cron_matches(expr: str, candidate_utc: datetime) -> bool:
 
 
 def _next_cron_run(expr: str, after_utc: datetime | None = None) -> str | None:
-    """다음 cron 실행 시각을 계산합니다."""
+    """다음 실행 시각을 반환한다. 수동 실행 전용의 경우 None을 반환한다."""
     if _is_manual_only_cron(expr):
         return None
     _parse_cron(expr)
@@ -1419,7 +1203,7 @@ _MINUTE = timedelta(minutes=1)
 # ---------------------------------------------------------------------------
 
 def connect_database(db_path: str) -> sqlite3.Connection:
-    """SQLite 데이터베이스에 연결하고 초기화합니다."""
+    """SQLite 데이터베이스에 접속하고, 행 접근 형식을 설정한다."""
     connection = sqlite3.connect(db_path, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
@@ -1428,7 +1212,7 @@ def connect_database(db_path: str) -> sqlite3.Connection:
 
 
 def initialize_database(connection: sqlite3.Connection) -> None:
-    """세션·메시지·스케줄용 데이터베이스 스키마를 초기화합니다."""
+    """세션/메시지/스케줄용 DB 스키마를 초기화한다."""
     connection.executescript("""
         PRAGMA foreign_keys = ON;
 
@@ -1537,10 +1321,10 @@ def _compile_agent_prompt(
     resolved_cwd: str,
     batch_mode: bool,
 ) -> str:
-    """에이전트 종류에 맞는 프롬프트를 구성합니다.
+    """에이전트 종별에 따른 프롬프트를 구축한다.
 
-    Claude의 경우 filePaths 주입을 수행하고, 보호 경로 검증은 _read_files_for_prompt 내부에서 처리합니다.
-    batch_mode일 때는 최종적으로 build_batch_prompt를 한 번만 적용합니다.
+        Claude의 경우 filePaths 인젝션을 수행하고, 보호 경로 검증은 _read_files_for_prompt 내에서 실시.
+        batch_mode 시에는 최종적으로 build_batch_prompt를 1회만 적용한다.
     """
     if agent == "claude":
         compiled = compile_claude_parts(request_messages)
@@ -1558,14 +1342,6 @@ def _compile_agent_prompt(
     return compiled
 
 
-def _build_scheduler_skip_permissions_args(job: dict[str, Any]) -> list[str]:
-    """스케줄러 실행 시 skipPermissions extra args를 생성합니다.
-
-    Claude에만 --dangerously-skip-permissions를 적용합니다.
-    """
-    if job.get("skipPermissions") and job["agent"] == "claude":
-        return ["--dangerously-skip-permissions"]
-    return []
 
 
 # ---------------------------------------------------------------------------
@@ -1573,9 +1349,9 @@ def _build_scheduler_skip_permissions_args(job: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 class SessionStore:
-    """세션, 메시지, 스케줄, 실행 결과를 저장하는 저장소입니다."""
+    """세션, 메시지, 스케줄, agent 실행을 영속화하는 스토어."""
     def __init__(self, *, connection: sqlite3.Connection, db_path: str, default_timeout_ms: int) -> None:
-        """SessionStore 인스턴스를 초기화합니다."""
+        """인스턴스의 의존 객체와 내부 상태를 초기화한다."""
         self.connection = connection
         self.db_path = db_path
         self.default_timeout_ms = default_timeout_ms
@@ -1587,7 +1363,7 @@ class SessionStore:
 
     @staticmethod
     def _serialize_session(row: sqlite3.Row | None) -> dict[str, Any] | None:
-        """session 행을 API 응답용 dict로 변환합니다."""
+        """sessions 테이블의 행을 API 응답용 dict로 변환한다."""
         if row is None:
             return None
         return {
@@ -1599,7 +1375,7 @@ class SessionStore:
 
     @staticmethod
     def _serialize_message(row: sqlite3.Row) -> dict[str, Any]:
-        """message 행을 API 응답용 dict로 변환합니다."""
+        """messages 테이블의 행을 API 응답용 dict로 변환한다."""
         return {
             "id": row["id"],
             "sessionId": row["session_id"],
@@ -1614,13 +1390,13 @@ class SessionStore:
     # -- internal helpers ----------------------------------------------------
 
     def _session_exists(self, session_id: str) -> bool:
-        """세션 존재 여부를 확인합니다."""
+        """지정 세션 ID가 저장 완료인지 확인한다."""
         return self.connection.execute(
             "SELECT id FROM sessions WHERE id = ?", (session_id,)
         ).fetchone() is not None
 
     def _next_order(self, session_id: str) -> int:
-        """다음 메시지 순서를 계산합니다."""
+        """세션 내에서 다음에 사용할 메시지 순서 번호를 취득한다."""
         row = self.connection.execute(
             "SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM messages WHERE session_id = ?",
             (session_id,),
@@ -1628,8 +1404,8 @@ class SessionStore:
         return int(row["max_order"]) + 1
 
     def list_messages(self, session_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        """메시지 목록을 반환합니다."""
-        limit = max(1, min(limit, 500))
+        """메시지 목록을 취득한다(읽기 전용)."""
+        limit = max(1, min(int(limit or 100), 5000))
         with self.lock:
             if session_id:
                 rows = self.connection.execute(
@@ -1646,7 +1422,7 @@ class SessionStore:
             return [self._serialize_message(row) for row in rows]
 
     def _resolve_session(self, agent: str, session_id: str | None) -> str:
-        """실행에 사용할 session ID를 결정합니다."""
+        """기존 또는 신규의 실행 대상 세션 ID를 결정한다."""
         if not session_id:
             created = self.create_session(title=f"{agent}-{_now_iso()}")
             return created["session"]["id"]
@@ -1659,7 +1435,7 @@ class SessionStore:
         prompt: str,
         supplemental: list[dict[str, str]],
     ) -> list[dict[str, str]]:
-        """현재 요청용 메시지 목록을 구성합니다."""
+        """prompt와 보충 messages에서 이번에 저장할 메시지 배열을 구축한다."""
         current: list[dict[str, str]] = []
         current.extend(supplemental)
         current.append({"role": "user", "content": prompt})
@@ -1671,7 +1447,7 @@ class SessionStore:
         current_messages: list[dict[str, str]],
         use_session: bool,
     ) -> list[dict[str, str]]:
-        """CLI에 전달할 대화 메시지를 구성합니다."""
+        """세션 이용 여부에 따라 CLI에 전달할 대화 이력을 취득한다."""
         if use_session:
             snapshot = self.get_session(session_id) or {}
             return [
@@ -1689,7 +1465,7 @@ class SessionStore:
         messages: list[dict[str, Any]] | None = None,
         is_session: bool = True,
     ) -> dict[str, Any]:
-        """새 세션을 생성합니다."""
+        """새 대화 세션을 생성하고, 초기 메시지를 저장한다."""
         session_id = str(uuid4())
         ts = _now_iso()
         normalized = normalize_messages(messages)
@@ -1710,7 +1486,7 @@ class SessionStore:
         return self.get_session(session_id)
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
-        """세션과 메시지 이력을 조회합니다."""
+        """세션 정보와 메시지 이력을 취득한다."""
         if not session_id:
             raise ValueError("sessionId is required")
 
@@ -1733,7 +1509,7 @@ class SessionStore:
             return {"session": self._serialize_session(session_row), "messages": messages}
 
     def list_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
-        """최근 세션 목록을 조회합니다."""
+        """갱신 일시 순으로 최근 세션 목록을 취득한다."""
         safe_limit = max(1, min(int(limit or 20), 100))
         with self.lock:
             rows = self.connection.execute(
@@ -1749,7 +1525,7 @@ class SessionStore:
         agent: str | None = None,
         is_session: bool = True,
     ) -> dict[str, Any]:
-        """기존 세션에 메시지를 추가합니다."""
+        """기존 세션에 메시지를 추가한다."""
         ts = _now_iso()
         normalized = normalize_messages(messages)
 
@@ -1772,7 +1548,7 @@ class SessionStore:
         return self.get_session(session_id)
 
     def delete_session(self, session_id: str) -> dict[str, Any]:
-        """세션을 삭제합니다."""
+        """지정 세션과 관련 메시지를 삭제한다."""
         with self.lock:
             if not self._session_exists(session_id):
                 return {"deleted": False, "sessionId": session_id}
@@ -1781,7 +1557,7 @@ class SessionStore:
         return {"deleted": True, "sessionId": session_id}
 
     def get_health(self) -> dict[str, Any]:
-        """저장소와 데이터베이스 상태를 반환합니다."""
+        """스토어와 데이터베이스의 헬스 정보를 반환한다."""
         return {
             "ok": True,
             "dbPath": self.db_path,
@@ -1792,7 +1568,7 @@ class SessionStore:
 
     @staticmethod
     def _serialize_workflow(row: sqlite3.Row | None) -> dict[str, Any] | None:
-        """workflow_runs 행을 API 응답용 dict로 변환한다."""
+        """workflow_runs의 행을 API 응답용 dict로 변환한다."""
         if row is None:
             return None
         return {
@@ -1807,7 +1583,7 @@ class SessionStore:
 
     @staticmethod
     def _serialize_workflow_decision(row: sqlite3.Row) -> dict[str, Any]:
-        """workflow_runs 행을 API 응답용 dict로 변환한다."""
+        """workflow_decisions의 행을 API 응답용 dict로 변환한다."""
         return {
             "id": row["id"],
             "workflowId": row["workflow_id"],
@@ -1837,7 +1613,7 @@ class SessionStore:
         objective: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """구조화된 작업 판단 로그를 담을 workflow를 생성한다."""
+        """구조화된 작업 판단 로그의 workflow를 생성한다."""
         workflow_id = str(uuid4())
         ts = _now_iso()
         with self.lock:
@@ -1878,7 +1654,7 @@ class SessionStore:
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """workflow에 stage/role 단위 판단 기록을 추가한다."""
+        """workflow에 stage/role 단위의 의사결정 기록을 추가한다."""
         if not workflow_id:
             raise ValueError("workflowId is required")
         normalized_stage = _normalize_workflow_stage(stage)
@@ -1948,7 +1724,7 @@ class SessionStore:
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any] | None:
-        """workflow 본문과 선택적 decision 이력을 조회한다."""
+        """workflow와 관련 decision을 취득한다."""
         if not workflow_id:
             raise ValueError("workflowId is required")
         safe_limit = max(1, min(int(limit or 50), 500))
@@ -1978,7 +1754,7 @@ class SessionStore:
         return workflow
 
     def list_workflows(self, *, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-        """최근 업데이트 순으로 workflow 목록을 조회한다."""
+        """갱신 일시 순으로 workflow 목록을 취득한다."""
         safe_limit = max(1, min(int(limit or 20), 100))
         with self.lock:
             if status:
@@ -1993,6 +1769,36 @@ class SessionStore:
                 ).fetchall()
         return [workflow for row in rows if (workflow := self._serialize_workflow(row)) is not None]
 
+    def list_workflow_decisions(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """workflow_decisions를 workflow 정보 포함하여 최신 순으로 취득한다."""
+        safe_limit = max(1, min(int(limit or 500), 5000))
+        with self.lock:
+            rows = self.connection.execute(
+                "SELECT d.*, "
+                "w.title AS workflow_title, w.objective AS workflow_objective, "
+                "w.status AS workflow_status, w.created_at AS workflow_created_at, "
+                "w.updated_at AS workflow_updated_at "
+                "FROM workflow_decisions d "
+                "JOIN workflow_runs w ON w.id = d.workflow_id "
+                "ORDER BY d.created_at DESC, d.workflow_id DESC, d.sequence DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        decisions: list[dict[str, Any]] = []
+        for row in rows:
+            decision = self._serialize_workflow_decision(row)
+            decision.update({
+                "workflowTitle": row["workflow_title"],
+                "workflowObjective": row["workflow_objective"],
+                "workflowStatus": row["workflow_status"],
+                "workflowCreatedAt": row["workflow_created_at"],
+                "workflowUpdatedAt": row["workflow_updated_at"],
+                "findingsText": _safe_json(decision.get("findings") or []),
+                "metadataText": _safe_json(decision.get("metadata") or {}),
+            })
+            decisions.append(decision)
+        return decisions
+
+
     def _maybe_record_workflow_decision(
         self,
         *,
@@ -2004,7 +1810,7 @@ class SessionStore:
         prompt: str,
         result: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """agent_run 결과를 workflow decision으로 자동 기록할 수 있으면 기록한다."""
+        """agent_run의 임의 workflow 메타데이터를 decision으로 저장한다."""
         if not workflow:
             return None
         workflow_id = str(workflow.get("id") or workflow.get("workflowId") or "").strip()
@@ -2036,7 +1842,7 @@ class SessionStore:
 
     @staticmethod
     def _serialize_schedule(row: sqlite3.Row | None) -> dict[str, Any] | None:
-        """schedule 행을 API 응답용 dict로 변환합니다."""
+        """scheduled_jobs의 행을 API 응답용 dict로 변환한다."""
         if row is None:
             return None
         prompt = row["prompt"]
@@ -2058,7 +1864,7 @@ class SessionStore:
 
     @staticmethod
     def _serialize_schedule_run(row: sqlite3.Row) -> dict[str, Any]:
-        """schedule run 행을 API 응답용 dict로 변환합니다."""
+        """scheduled_runs의 행을 API 응답용 dict로 변환한다."""
         return {
             "id": row["id"],
             "jobId": row["job_id"],
@@ -2081,7 +1887,7 @@ class SessionStore:
         skip_permissions: bool = False,
         enabled: bool = True,
     ) -> dict[str, Any]:
-        """새 스케줄 작업을 생성합니다."""
+        """cron 스케줄 잡을 생성하고, 다음 실행 시각을 설정한다."""
         if agent not in {"claude", "codex"}:
             raise ValueError("agent must be claude or codex")
         if not name.strip():
@@ -2114,7 +1920,7 @@ class SessionStore:
         return self.get_schedule(job_id) or {"id": job_id}
 
     def get_schedule(self, job_id: str) -> dict[str, Any] | None:
-        """스케줄 작업 상세를 조회합니다."""
+        """지정 스케줄 잡의 설정을 취득한다."""
         with self.lock:
             row = self.connection.execute(
                 "SELECT * FROM scheduled_jobs WHERE id = ?", (job_id,)
@@ -2122,7 +1928,7 @@ class SessionStore:
         return self._serialize_schedule(row)
 
     def list_schedules(self, include_disabled: bool = True) -> list[dict[str, Any]]:
-        """스케줄 작업 목록을 조회합니다."""
+        """스케줄 잡 목록을 취득한다."""
         where = "" if include_disabled else "WHERE enabled = 1"
         with self.lock:
             rows = self.connection.execute(
@@ -2141,7 +1947,7 @@ class SessionStore:
         skip_permissions: bool | None = None,
         enabled: bool | None = None,
     ) -> dict[str, Any]:
-        """기존 스케줄 작업을 갱신합니다."""
+        """기존 스케줄 잡의 설정을 갱신한다."""
         current = self.get_schedule(job_id)
         if current is None:
             raise ValueError(f"schedule not found: {job_id}")
@@ -2184,7 +1990,7 @@ class SessionStore:
         return self.get_schedule(job_id) or {"id": job_id}
 
     def delete_schedule(self, job_id: str) -> dict[str, Any]:
-        """스케줄 작업을 삭제합니다."""
+        """지정 스케줄 잡을 삭제한다."""
         with self.lock:
             row = self.connection.execute("SELECT id FROM scheduled_jobs WHERE id = ?", (job_id,)).fetchone()
             if row is None:
@@ -2194,7 +2000,7 @@ class SessionStore:
         return {"deleted": True, "jobId": job_id}
 
     def list_due_schedule_ids(self, limit: int = 5) -> list[str]:
-        """실행 시각이 된 스케줄 ID 목록을 조회합니다."""
+        """현재 실행 기한에 도달한 스케줄 ID를 취득한다."""
         now = _now_iso()
         safe_limit = max(1, min(int(limit or 5), 50))
         with self.lock:
@@ -2214,8 +2020,8 @@ class SessionStore:
         return due_ids
 
     def list_schedule_runs(self, job_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-        """스케줄 실행 이력을 조회합니다."""
-        safe_limit = max(1, min(int(limit or 20), 100))
+        """스케줄 실행 이력을 취득한다."""
+        safe_limit = max(1, min(int(limit or 20), 5000))
         with self.lock:
             if job_id:
                 rows = self.connection.execute(
@@ -2230,7 +2036,7 @@ class SessionStore:
         return [self._serialize_schedule_run(row) for row in rows]
 
     def _claim_schedule_run(self, job_id: str, *, force: bool = False) -> tuple[str, dict[str, Any]]:
-        """running=1 을 DB에 동기적으로 기록하고 (run_id, job) 을 반환한다."""
+        """running=1을 동기적으로 기록하고, (run_id, job)를 반환한다."""
         job = self.get_schedule(job_id)
         if job is None:
             raise ValueError(f"schedule not found: {job_id}")
@@ -2256,18 +2062,18 @@ class SessionStore:
         return run_id, job
 
     def _begin_schedule_execution(self) -> None:
-        """실행 중 스케줄 수를 증가시킵니다."""
+        """실행 중 스케줄 수를 늘리고, shutdown 대기 대상으로 등록한다."""
         with self.active_run_lock:
             self.active_run_count += 1
 
     def _end_schedule_execution(self) -> None:
-        """실행 중 스케줄 수를 감소시킵니다."""
+        """실행 중 스케줄 수를 줄이고, 대기 중인 shutdown 처리에 통지한다."""
         with self.active_run_lock:
             self.active_run_count = max(0, self.active_run_count - 1)
             self.active_run_lock.notify_all()
 
     def wait_for_schedule_executions(self, timeout_seconds: float) -> bool:
-        """실행 중 스케줄이 끝날 때까지 대기합니다."""
+        """실행 중 스케줄이 완료될 때까지 지정 초수만 대기한다."""
         deadline = time.monotonic() + max(0.0, timeout_seconds)
         with self.active_run_lock:
             while self.active_run_count > 0:
@@ -2290,7 +2096,7 @@ class SessionStore:
         error: str | None,
         next_run_at: str | None,
     ) -> None:
-        """스케줄 실행 결과를 DB에 반영합니다."""
+        """실행 결과를 저장한다. 통상 connection이 닫힌 경우는 임시 connection으로 복구한다."""
         try:
             with self.lock:
                 self.connection.execute(
@@ -2325,7 +2131,7 @@ class SessionStore:
             fallback.close()
 
     def _execute_schedule_run(self, *, job_id: str, run_id: str, job: dict[str, Any]) -> dict[str, Any]:
-        """실제 에이전트 실행 및 결과 DB 저장. _claim_schedule_run 이후에 호출한다."""
+        """실제 에이전트 실행과 실행 결과 저장을 수행한다."""
         self._begin_schedule_execution()
         status = "failed"
         exit_code: int | None = None
@@ -2333,13 +2139,11 @@ class SessionStore:
         stderr = ""
         error: str | None = None
         try:
-            extra_args = _build_scheduler_skip_permissions_args(job)
             result = self.run_agent(
                 agent=job["agent"],
                 prompt=job["prompt"],
-                extra_args=extra_args if extra_args else None,
+                extra_args=None,
                 batch_mode=True,
-                _internal=True,
             )
             status = str(result["status"])
             exit_code = int(result["exitCode"])
@@ -2377,7 +2181,7 @@ class SessionStore:
                 self._end_schedule_execution()
 
     def run_schedule(self, job_id: str, *, force: bool = False) -> dict[str, Any]:
-        """스케줄 작업을 실행합니다."""
+        """지정 스케줄을 claim하여 agent 실행을 시작한다."""
         run_id, job = self._claim_schedule_run(job_id, force=force)
         return self._execute_schedule_run(job_id=job_id, run_id=run_id, job=job)
 
@@ -2393,18 +2197,14 @@ class SessionStore:
         messages: list[dict[str, Any]] | None = None,
         file_paths: list[str] | None = None,
         allowed_tools_pattern: str | None = None,
-        codex_mcp_approved_tools: list[str] | None = None,
-        codex_mcp_approved_write_tools: list[str] | None = None,
-        approve_codex_mcp_writes: bool = False,
         cwd: str | None = None,
         timeout_ms: int | None = None,
         extra_args: list[str] | None = None,
         workflow: dict[str, Any] | None = None,
         run_id: str | None = None,
         batch_mode: bool = False,
-        _internal: bool = False,
     ) -> dict[str, Any]:
-        """세션 기반 agent 실행을 수행합니다."""
+        """세션 관리 포함 agent CLI 실행을 수행하고, 결과를 저장한다."""
         if agent not in {"claude", "codex"}:
             raise ValueError("agent must be claude or codex")
         if not prompt:
@@ -2445,12 +2245,8 @@ class SessionStore:
             timeout_ms=effective_timeout_ms,
             allowed_tools_pattern=allowed_tools_pattern,
             extra_args=extra_args or [],
-            codex_mcp_approved_tools=codex_mcp_approved_tools,
-            codex_mcp_approved_write_tools=codex_mcp_approved_write_tools,
-            approve_codex_mcp_writes=approve_codex_mcp_writes,
             run_id=run_id,
             session_id=active_session_id,
-            _internal=_internal,
         )
         status = "completed" if result["exitCode"] == 0 else "failed"
         mcp_tool_cancelled = _is_mcp_tool_cancelled(result["stdout"], result["stderr"])
@@ -2515,28 +2311,28 @@ class SessionStore:
 # ---------------------------------------------------------------------------
 
 class ScheduleRunner:
-    """로컬 cron 작업을 백그라운드에서 실행하는 실행기."""
+    """로컬 cron 잡을 백그라운드로 실행하는 실행기."""
 
     def __init__(self, *, store: SessionStore, interval_seconds: int = 30) -> None:
-        """ScheduleRunner 인스턴스를 초기화합니다."""
+        """인스턴스의 의존 객체와 내부 상태를 초기화한다."""
         self.store = store
         self.interval_seconds = max(5, int(interval_seconds or 30))
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="orch-scheduler", daemon=True)
 
     def start(self) -> None:
-        """스케줄 감시 스레드를 시작합니다."""
+        """백그라운드 스케줄 감시 스레드를 시작한다."""
         self._thread.start()
         _log("schedule.runner_started", interval_seconds=self.interval_seconds)
 
     def stop(self) -> None:
-        """스케줄 감시 스레드를 중지합니다."""
+        """백그라운드 스케줄 감시 스레드의 정지를 요청한다."""
         self._stop.set()
         self._thread.join(timeout=5)
         _log("schedule.runner_stopped")
 
     def _loop(self) -> None:
-        """주기적으로 실행 시각이 된 스케줄을 감시합니다."""
+        """주기적으로 기한 도래 스케줄을 검출하고, 실행 스레드를 시작한다."""
         while not self._stop.is_set():
             try:
                 for job_id in self.store.list_due_schedule_ids():
@@ -2552,11 +2348,12 @@ class ScheduleRunner:
 
 
 def _nav_links(active: str = "") -> str:
-    """탐색 링크 HTML을 생성합니다."""
+    """네비게이션 링크를 생성한다."""
     items = [
         ("Dashboard", "/"),
         ("Runs", "/runs"),
         ("Messages", "/messages"),
+        ("Workflow Decisions", "/workflow-decisions"),
     ]
     parts = []
     for label, href in items:
@@ -2567,14 +2364,66 @@ def _nav_links(active: str = "") -> str:
     return " | ".join(parts)
 
 
+def _json_script_data(value: Any) -> str:
+    """HTML script 내에 안전하게 삽입할 JSON 문자열을 생성한다."""
+    return (
+        json.dumps(value, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
+def _grid_page_body(
+    *,
+    title: str,
+    subtitle: str,
+    nav: str,
+    grid_id: str,
+    rows: list[dict[str, Any]],
+    columns: list[dict[str, Any]],
+    height: str = "calc(100vh - 190px)",
+    extra_controls: str = "",
+) -> str:
+    """AG Grid 표시용 공통 페이지 본문을 생성한다."""
+    data_id = f"{grid_id}-data"
+    columns_id = f"{grid_id}-columns"
+    return f"""
+<div class="header">
+  <div>
+    <h1>{html.escape(title)}</h1>
+    <span class="subtitle">{subtitle} &nbsp;|&nbsp; {nav}</span>
+  </div>
+</div>
+<div class="card">
+  <div class="grid-toolbar">
+    <input id="{grid_id}-quick-filter" class="grid-search" placeholder="Quick filter: 전체 열 전문 검색...">
+    <span class="grid-count">Rows: {len(rows)}</span>
+    {extra_controls}
+  </div>
+  <div id="{grid_id}" class="ag-theme-quartz-dark" style="height:{height};width:100%;"></div>
+</div>
+<script type="application/json" id="{data_id}">{_json_script_data(rows)}</script>
+<script type="application/json" id="{columns_id}">{_json_script_data(columns)}</script>
+<script>
+window.addEventListener('DOMContentLoaded', function() {{
+  renderGridFromScript('{grid_id}', '{data_id}', '{columns_id}');
+}});
+</script>
+"""
+
+
 def _html_page(title: str, body: str) -> bytes:
-    """공통 HTML 페이지를 렌더링합니다."""
+    """Web UI의 공통 HTML 레이아웃을 생성한다."""
     return f"""<!doctype html>
-<html lang="ko">
+<html lang="ja">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(title)}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.9/styles/ag-grid.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.9/styles/ag-theme-quartz.css">
+  <script src="https://cdn.jsdelivr.net/npm/ag-grid-community@32.3.9/dist/ag-grid-community.min.js"></script>
   <link rel="icon" type="image/jpeg" href="data:image/jpeg;base64,/9j/2wCEAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDIBCQkJDAsMGA0NGDIhHCEyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMv/AABEIAEAAQAMBIgACEQEDEQH/xAGiAAABBQEBAQEBAQAAAAAAAAAAAQIDBAUGBwgJCgsQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+gEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoLEQACAQIEBAMEBwUEBAABAncAAQIDEQQFITEGEkFRB2FxEyIygQgUQpGhscEJIzNS8BVictEKFiQ04SXxFxgZGiYnKCkqNTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqCg4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2gAMAwEAAhEDEQA/APM/tLk5yeeuep/z6VSv2aWFgTnNWQuRSSwbkNcEZWZ6U4to52OEs2K17DR5bo/KppbKx824K9OM13C6xo3hKzZLmF7m8lhVo41HAPqx7DitJ1ndRhqzmjSVm5bHHTaJNC2Ch/Kp7PRpZGxtP5U658XXuoyl/LgjJOdqxZX8K6bwfrdlqd2tjeJHBdtxGwPyyew9DUV516cHKxdFUZSszMXw+4HKH8qadCYH7tepvpKAH5R0qsdHDMflA4rzaeYSkz0XhYJHj6NjAqXcMVUV+Pen7+K7uU5+Y0LFVWUN3rDYrqOtXM95J+7VyOTjgcAfkK2rNs7OcVnwWRF7eLEULCc4JGQB16fjWlD4mZVldI7jw2NIt7fzJEtXiPUtGGAH403xZBoAht9U8PSwboJB54iGNpzkNjtz6cVS0W0edLqJ2AdIg2QuBnPpWpZ6O50u9GoXYMZgcIpQckjjBH4V2uKtczlFtJWPSbG4Go6VaXox++hWTgccjNK0e3Gf0qLw+iw+GdMjySFtY1yf90VPMBg8H86+VdHkm0u56cJ3irnzaHxTxJ8tQEEUAnFe/Y8+5q2koWNSasRqouzKh+/1HvVK2hkmVI4o3d24CoMk/hWkthcxTNDKhjlj6oeqn0PpUxTUtDWLuieG8e21AkTzRZwT5aZbHtxXVaaBfXEESljDI3KOP4e+R9K5m2f58SwlmX8DXoXhOxQ2st/LHiRyVjH91f8A65/zzXbKXLC5inqdXtEcQVcBQMAen+f8+1OeX5MDrVljlFzjkf5/z/kZ84wpx1FeTKlqdEJnBeB/AaapOl5qtvIbcgGGFSoMn+0c9v516k+haRa26WzadC9rGRm2uLdPkyeoAGCM101lFFYxJGihokACsTkqPy6VQ165hkhkRwEmhXcOeqn09q7acb7nLOd2Vml0zTdDkXT7C3toz0jgjCfMe/HevKtQ8OXaTPewgzq5LOQPmGfUV2sDtc28WTxyf1Natla4YHpXdRoxn8RhOrKn8J5pZ6XLMM7ACO5713ugaVcS6WYol3Sw8svqp9P14rqYrWKVdjxRnJHzFBkVu2sMcOQgUD2AFKtT6MmOJ5tEjzyRNg2sjK46huo/z/ntihcN8h55BxXo+t6Qmo2jtGoW5UZRvX2NeZXTHDZHI6iuKcLM6adTmP/Z">
   <style>
     :root {{
@@ -2681,11 +2530,28 @@ def _html_page(title: str, body: str) -> bytes:
     .runs-table td {{ padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 0.85rem; vertical-align: top; }}
     .runs-table .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: var(--text-secondary); }}
 
+    .grid-toolbar {{ display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }}
+    .grid-search {{ flex: 1; min-width: 260px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; color: var(--text-primary); font-size: 0.9rem; }}
+    .grid-search:focus {{ border-color: var(--accent-blue); outline: none; }}
+    .grid-count {{ color: var(--text-muted); font-size: 0.85rem; }}
+    .grid-link {{ white-space: nowrap; }}
+    .ag-theme-quartz-dark {{ --ag-background-color: var(--bg-card); --ag-foreground-color: var(--text-primary); --ag-border-color: var(--border); --ag-header-background-color: #243b5a; --ag-header-foreground-color: #f8fafc; --ag-header-column-separator-color: rgba(148,163,184,0.45); --ag-odd-row-background-color: rgba(15,25,35,0.35); --ag-row-hover-color: rgba(59,130,246,0.12); }}
+    .ag-theme-quartz-dark .ag-header {{ border-bottom: 2px solid var(--accent-blue); box-shadow: 0 2px 8px rgba(0,0,0,0.22); }}
+    .ag-theme-quartz-dark .ag-header-cell-label {{ font-weight: 700; letter-spacing: 0.02em; }}
+    .ag-theme-quartz-dark .ag-floating-filter {{ background: #1b2f49; border-top: 1px solid rgba(148,163,184,0.25); }}
+    .ag-cell-wrap {{ white-space: pre-wrap; line-height: 1.35; }}
+    .text-preview {{ display: flex; align-items: center; gap: 8px; height: 44px; max-height: 44px; overflow: hidden; line-height: 1.35; }}
+    .text-preview-text {{ flex: 1; min-width: 0; color: var(--text-secondary); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; white-space: normal; word-break: break-word; }}
+    .text-preview-button {{ flex: 0 0 auto; padding: 3px 8px; border: 1px solid var(--accent-blue); border-radius: 6px; background: rgba(59,130,246,0.16); color: #bfdbfe; cursor: pointer; font-size: 0.75rem; line-height: 1.2; }}
+    .text-preview-button:hover {{ background: rgba(59,130,246,0.28); }}
+
     .modal-overlay {{ display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; align-items: center; justify-content: center; }}
     .modal-overlay.active {{ display: flex; }}
     .modal {{ background: var(--bg-card); border: 1px solid var(--border); border-radius: 16px; padding: 32px; width: 90%; max-width: 520px; max-height: 90vh; overflow-y: auto; }}
     .modal h2 {{ margin-bottom: 20px; }}
     .modal .btn-row {{ display: flex; gap: 12px; margin-top: 20px; }}
+    .text-view-modal {{ max-width: 1100px; width: 92%; }}
+    .text-view-content {{ background: var(--bg-input); border: 1px solid var(--border); border-radius: 10px; padding: 16px; max-height: 68vh; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; line-height: 1.45; color: var(--text-primary); }}
 
     @media (max-width: 900px) {{
       .stats {{ grid-template-columns: repeat(2, 1fr); }}
@@ -2730,17 +2596,28 @@ def _html_page(title: str, body: str) -> bytes:
       </div>
       <div class="checkbox-group">
         <input type="checkbox" name="skipPermissions" id="edit-skipPermissions">
-        <label for="edit-skipPermissions">Skip Permissions (파일 쓰기 허용)</label>
+        <label for="edit-skipPermissions">Skip Permissions (파일 쓰기 허가)</label>
       </div>
       <div class="checkbox-group">
         <input type="checkbox" name="enabled" id="edit-enabled">
-        <label for="edit-enabled">활성</label>
+        <label for="edit-enabled">유효</label>
       </div>
       <div class="btn-row">
         <button type="submit" class="btn btn-primary">Save Changes</button>
         <button type="button" class="btn btn-ghost" onclick="closeEditModal()">Cancel</button>
       </div>
     </form>
+  </div>
+</div>
+
+<div class="modal-overlay" id="textViewModal">
+  <div class="modal text-view-modal">
+    <h2 id="textViewTitle">Text</h2>
+    <pre id="textViewContent" class="text-view-content"></pre>
+    <div class="btn-row">
+      <button type="button" class="btn btn-primary" onclick="copyTextViewContent()">Copy</button>
+      <button type="button" class="btn btn-ghost" onclick="closeTextViewModal()">Close</button>
+    </div>
   </div>
 </div>
 
@@ -2752,6 +2629,101 @@ def _html_page(title: str, body: str) -> bytes:
 <style>@keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}</style>
 
 <script>
+var _textViewRaw = '';
+var _TEXT_PREVIEW_LIMIT = 300;
+
+function openTextViewModal(title, text) {{
+  _textViewRaw = text || '';
+  document.getElementById('textViewTitle').textContent = title || 'Text';
+  document.getElementById('textViewContent').textContent = _textViewRaw;
+  document.getElementById('textViewModal').classList.add('active');
+}}
+
+function closeTextViewModal() {{
+  document.getElementById('textViewModal').classList.remove('active');
+}}
+
+function copyTextViewContent() {{
+  if (!navigator.clipboard) {{
+    showToast('Clipboard API를 사용할 수 없습니다', 'error');
+    return;
+  }}
+  navigator.clipboard.writeText(_textViewRaw).then(function() {{
+    showToast('Copied', 'success');
+  }}).catch(function(err) {{
+    showToast(err.message || 'Copy failed', 'error');
+  }});
+}}
+
+function textPreviewRenderer(params) {{
+  const value = params.value == null ? '' : String(params.value);
+  const title = params.colDef.headerName || params.colDef.field || 'Text';
+  const root = document.createElement('div');
+  root.className = 'text-preview';
+  const text = document.createElement('span');
+  text.className = 'text-preview-text';
+  text.textContent = value.length > _TEXT_PREVIEW_LIMIT ? value.slice(0, _TEXT_PREVIEW_LIMIT) + '…' : value;
+  root.appendChild(text);
+  if (value.length > _TEXT_PREVIEW_LIMIT) {{
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'text-preview-button';
+    button.textContent = 'View';
+    button.addEventListener('click', function(event) {{
+      event.preventDefault();
+      event.stopPropagation();
+      openTextViewModal(title, value);
+    }});
+    root.appendChild(button);
+  }}
+  return root;
+}}
+
+function renderGridFromScript(gridId, dataId, columnsId) {{
+  const gridEl = document.getElementById(gridId);
+  const dataEl = document.getElementById(dataId);
+  const columnsEl = document.getElementById(columnsId);
+  if (!gridEl || !dataEl || !columnsEl) return;
+  const rowData = JSON.parse(dataEl.textContent || '[]');
+  const columnDefs = JSON.parse(columnsEl.textContent || '[]');
+  const quickFilter = document.getElementById(gridId + '-quick-filter');
+  const gridOptions = {{
+    rowData: rowData,
+    columnDefs: columnDefs,
+    defaultColDef: {{
+      sortable: true,
+      filter: true,
+      floatingFilter: true,
+      resizable: true,
+      minWidth: 120,
+    }},
+    pagination: true,
+    paginationPageSize: 50,
+    paginationPageSizeSelector: [25, 50, 100, 500],
+    rowHeight: 56,
+    animateRows: false,
+    enableCellTextSelection: true,
+    ensureDomOrder: true,
+    components: {{
+      textPreviewRenderer: textPreviewRenderer,
+    }},
+    tooltipShowDelay: 250,
+    getRowId: function(params) {{
+      return String(params.data.id || (params.data.workflowId + '-' + params.data.sequence));
+    }},
+  }};
+  if (!window.agGrid || !window.agGrid.createGrid) {{
+    gridEl.innerHTML = '<div class="empty">AG Grid 라이브러리를 로드할 수 없습니다. 네트워크 또는 CDN 설정을 확인해 주세요.</div>';
+    return;
+  }}
+  const api = window.agGrid.createGrid(gridEl, gridOptions);
+  if (quickFilter) {{
+    quickFilter.addEventListener('input', function() {{
+      api.setGridOption('quickFilterText', quickFilter.value);
+    }});
+  }}
+}}
+
 function showLoading(text) {{
   document.getElementById('loading-text').textContent = text || '실행 중...';
   document.getElementById('loading-overlay').style.display = 'flex';
@@ -2820,7 +2792,7 @@ document.querySelectorAll('form[action="/schedule/run"]').forEach(function(form)
       btn.style.opacity = '0.5';
       btn.style.cursor = 'not-allowed';
     }}
-    showLoading('배치 실행 중... 완료될 때까지 기다려주세요.');
+    showLoading('배치 실행 중... 완료까지 기다려 주세요.');
     fetch(form.action, {{
       method: 'POST',
       headers: {{
@@ -2865,7 +2837,7 @@ document.querySelectorAll('form[action="/schedule/run"]').forEach(function(form)
 (function() {{
   var _pollTimer = null;
   var _pollFailureCount = 0;
-  var _runLoadingText = '배치 실행 중... 완료될 때까지 기다려주세요.';
+  var _runLoadingText = '배치 실행 중... 완료까지 기다려 주세요.';
 
   function _updateJobStatus(job) {{
     var item = document.querySelector('[data-job-id="' + job.id + '"]');
@@ -2902,11 +2874,11 @@ document.querySelectorAll('form[action="/schedule/run"]').forEach(function(form)
             var span = document.createElement('span');
             span.id = 'runningLabel';
             span.style.color = 'var(--accent-orange)';
-            span.textContent = '実行中 ' + runningCount + '件';
+            span.textContent = '실행 중 ' + runningCount + '건';
             subtitle.appendChild(document.createTextNode(' — '));
             subtitle.appendChild(span);
           }} else if (label) {{
-            label.textContent = '実行中 ' + runningCount + '件';
+            label.textContent = '실행 중 ' + runningCount + '건';
           }}
         }} else {{
           hideLoading();
@@ -2925,7 +2897,7 @@ document.querySelectorAll('form[action="/schedule/run"]').forEach(function(form)
           clearInterval(_pollTimer);
           _pollTimer = null;
           hideLoading();
-          showToast('작업 상태를 가져오지 못했습니다. 페이지를 다시 불러와 주세요.', 'error');
+          showToast('잡 상태 취득에 실패했습니다. 페이지를 새로고침해 주세요.', 'error');
         }}
       }});
   }}
@@ -2968,39 +2940,51 @@ function closeEditModal() {{
 document.getElementById('editModal').addEventListener('click', function(e) {{
   if (e.target === this) closeEditModal();
 }});
+document.getElementById('textViewModal').addEventListener('click', function(e) {{
+  if (e.target === this) closeTextViewModal();
+}});
 </script>
 </body>
 </html>""".encode("utf-8")
 
 
+def _query_int(values: dict[str, list[str]], key: str, default: int) -> int:
+    """쿼리 문자열의 정수값을 안전하게 취득한다."""
+    raw = values.get(key, [str(default)])[0]
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _form_bool(values: dict[str, list[str]], key: str, default: bool = False) -> bool:
-    """폼 값을 불리언으로 해석합니다."""
+    """폼 값을 불리언으로 해석한다."""
     if key not in values:
         return default
     return str(values.get(key, [""])[0]).lower() in {"1", "true", "on", "yes"}
 
 
 def _form_int(values: dict[str, list[str]], key: str) -> int | None:
-    """폼 값을 정수로 해석합니다."""
+    """폼 값을 정수로 변환하고, 실패 시 기본값을 반환한다."""
     raw = values.get(key, [""])[0].strip()
     return int(raw) if raw else None
 
 
 class WebUiHandler(BaseHTTPRequestHandler):
-    """간단한 Web UI 요청을 처리하는 핸들러입니다."""
+    """로컬 Web UI의 HTTP 요청을 처리하는 핸들러."""
     server_version = "OrchestrationWebUI/0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        """기본 접근 로그를 구조화 로그로 기록합니다."""
+        """HTTP 서버 기본 로그를 구조화 로그로 전달한다."""
         _log("web.access", client=self.client_address[0], message=fmt % args)
 
     @property
     def store(self) -> SessionStore:
-        """초기화된 SessionStore 인스턴스를 반환합니다."""
+        """Web UI에서 이용하는 SessionStore를 취득한다."""
         return _get_store()
 
     def _send(self, status: HTTPStatus, body: str | bytes, content_type: str = "text/html; charset=utf-8") -> None:
-        """HTTP 응답 본문을 전송합니다."""
+        """HTTP 응답 본문과 헤더를 전송한다."""
         data = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(status.value)
         self.send_header("Content-Type", content_type)
@@ -3009,42 +2993,44 @@ class WebUiHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _redirect(self, location: str = "/") -> None:
-        """지정 경로로 리다이렉트합니다."""
+        """지정 경로로의 HTTP 리다이렉트를 전송한다."""
         self.send_response(HTTPStatus.SEE_OTHER.value)
         self.send_header("Location", location)
         self.end_headers()
 
     def _read_form(self) -> dict[str, list[str]]:
-        """POST form 데이터를 읽습니다."""
+        """POST 요청 본문을 폼 값으로 해석한다."""
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length).decode("utf-8") if length else ""
         return parse_qs(raw, keep_blank_values=True)
 
     def _prefers_json(self) -> bool:
-        """JSON 응답 선호 여부를 판단합니다."""
+        """요청이 JSON 응답을 우선하는지 판정한다."""
         requested_with = self.headers.get("X-Requested-With", "")
         accept = self.headers.get("Accept", "")
         return requested_with.lower() == "fetch" or "application/json" in accept.lower()
 
     def do_GET(self) -> None:  # noqa: N802
-        """HTTP GET 요청을 처리합니다."""
+        """Web UI의 GET 요청을 라우팅하여 응답한다."""
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self._send(HTTPStatus.OK, json.dumps(self.store.get_health(), ensure_ascii=False), "application/json; charset=utf-8")
             return
         if parsed.path == "/runs":
             query = parse_qs(parsed.query)
-            self._render_runs(query.get("jobId", [None])[0])
+            limit = _query_int(query, "limit", 500)
+            self._render_runs(query.get("jobId", [None])[0], limit)
             return
         if parsed.path == "/messages":
             query = parse_qs(parsed.query)
             session_id = query.get("sessionId", [None])[0]
-            limit_raw = query.get("limit", ["100"])[0]
-            try:
-                limit = int(limit_raw)
-            except ValueError:
-                limit = 100
+            limit = _query_int(query, "limit", 500)
             self._render_messages(session_id, limit)
+            return
+        if parsed.path == "/workflow-decisions":
+            query = parse_qs(parsed.query)
+            limit = _query_int(query, "limit", 500)
+            self._render_workflow_decisions(limit)
             return
         if parsed.path == "/api/schedule":
             query = parse_qs(parsed.query)
@@ -3064,7 +3050,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
         self._render_index()
 
     def do_POST(self) -> None:  # noqa: N802
-        """HTTP POST 요청을 처리합니다."""
+        """Web UI의 POST 요청을 라우팅하여 상태를 갱신한다."""
         parsed = urlparse(self.path)
         form = self._read_form()
         try:
@@ -3117,7 +3103,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.BAD_REQUEST, _html_page("Error", f"<h1>요청 실패</h1><p class='danger'>{html.escape(str(exc))}</p><p><a href='/'>돌아가기</a></p>"))
 
     def _render_index(self) -> None:
-        """대시보드 메인 페이지를 렌더링합니다."""
+        """Web UI의 스케줄 목록/작성 화면을 렌더링한다."""
         jobs = self.store.list_schedules(include_disabled=True)
         runs = self.store.list_schedule_runs(job_id=None, limit=5)
 
@@ -3127,7 +3113,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
         failed_runs = sum(1 for r in runs if r["status"] == "failed")
         agents_used = len(set(j["agent"] for j in jobs)) if jobs else 0
 
-        # 최근 실행 이력 목록
+        # 최근 활동
         activity_items = []
         for run in runs[:5]:
             status_class = "success" if run["status"] == "completed" else ("running" if run["status"] == "running" else "failed")
@@ -3137,11 +3123,11 @@ class WebUiHandler(BaseHTTPRequestHandler):
   <span class="activity-dot {status_class}"></span>
   <div class="activity-info">
     <div class="activity-title">{html.escape(job_name)} — {html.escape(run['status'])}</div>
-    <div class="activity-time">{html.escape(str(run['startedAt']))}</div>
+    <div class="activity-time">{html.escape(_format_kst(run['startedAt']))}</div>
   </div>
 </li>""")
 
-        # 스케줄 목록
+        # 활성 스케줄 목록
         schedule_items = []
         for job in jobs:
             status = "running" if job["running"] else ("enabled" if job["enabled"] else "disabled")
@@ -3177,7 +3163,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
         body = f"""
 <div class="header">
   <div>
-    <h1>MCP Orchestration</h1>
+    <h1>AI AGENT ORCHESTRATION</h1>
     <span class="subtitle">스케줄 관리 대시보드 &nbsp;|&nbsp; {nav}</span>
   </div>
 </div>
@@ -3195,7 +3181,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
     <form method="post" action="/schedule/create">
       <div class="form-group">
         <label>Name</label>
-        <input name="name" placeholder="스케줄 이름" required>
+        <input name="name" placeholder="스케줄명" required>
       </div>
       <div class="form-group">
         <label>Agent</label>
@@ -3214,7 +3200,7 @@ class WebUiHandler(BaseHTTPRequestHandler):
       </div>
       <div class="form-group">
         <label>Cron Expression</label>
-        <input name="cronExpr" value="*/10 * * * *" placeholder="*/10 * * * * (수동 전용: - - - - - -)" required>
+        <input name="cronExpr" value="*/10 * * * *" placeholder="*/10 * * * * (수동만: - - - - - -)" required>
       </div>
       <div class="form-group">
         <label>Prompt</label>
@@ -3222,11 +3208,11 @@ class WebUiHandler(BaseHTTPRequestHandler):
       </div>
       <div class="checkbox-group">
         <input type="checkbox" name="skipPermissions" id="skip-perm-check">
-        <label for="skip-perm-check">Skip Permissions (파일 쓰기 허용)</label>
+        <label for="skip-perm-check">Skip Permissions (파일 쓰기 허가)</label>
       </div>
       <div class="checkbox-group">
         <input type="checkbox" name="enabled" id="enabled-check" checked>
-        <label for="enabled-check">활성화해서 생성</label>
+        <label for="enabled-check">활성화하여 생성</label>
       </div>
       <button type="submit" class="btn btn-primary">Create Schedule</button>
     </form>
@@ -3241,97 +3227,135 @@ class WebUiHandler(BaseHTTPRequestHandler):
     <div class="card">
       <h2>Recent Activity</h2>
       {f'<ul class="activity-list">{"".join(activity_items)}</ul>' if activity_items else '<div class="empty">실행 이력 없음</div>'}
-      <div style="margin-top:12px;"><a href="/runs">모든 실행 이력 보기 →</a></div>
+      <div style="margin-top:12px;"><a href="/runs">모든 실행 이력 표시 →</a></div>
     </div>
   </div>
 </div>
 """
-        self._send(HTTPStatus.OK, _html_page("MCP Orchestration", body))
+        self._send(HTTPStatus.OK, _html_page("AI AGENT ORCHESTRATION", body))
 
-    def _render_runs(self, job_id: str | None) -> None:
-        """실행 이력 페이지를 렌더링합니다."""
-        runs = self.store.list_schedule_runs(job_id=job_id, limit=50)
-        rows = []
+    def _render_runs(self, job_id: str | None, limit: int) -> None:
+        """지정 스케줄의 실행 이력 화면을 AG Grid로 렌더링한다."""
+        safe_limit = max(1, min(int(limit or 500), 5000))
+        runs = self.store.list_schedule_runs(job_id=job_id, limit=safe_limit)
         for run in runs:
-            status_class = "success" if run["status"] == "completed" else ("running" if run["status"] == "running" else "failed")
-            status_color = "var(--accent-green)" if run["status"] == "completed" else ("var(--accent-orange)" if run["status"] == "running" else "var(--accent-red)")
-            rows.append(f"""
-<tr>
-  <td class="mono">{html.escape(run['id'][:12])}</td>
-  <td><span class="status-badge {status_class}">{html.escape(run['status'])}</span></td>
-  <td style="color:{status_color}">{html.escape(str(run['exitCode']))}</td>
-  <td class="mono">{html.escape(str(run['startedAt']))}</td>
-  <td class="mono">{html.escape(str(run['finishedAt'] or '-'))}</td>
-  <td class="mono" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;">{html.escape(_truncate(run.get('stderr') or run.get('error') or '-', 300))}</td>
-</tr>""")
+            run["startedAtKst"] = _format_kst(run.get("startedAt"))
+            run["finishedAtKst"] = _format_kst(run.get("finishedAt"))
+            run["searchText"] = "\n".join(str(run.get(key) or "") for key in [
+                "id", "jobId", "status", "exitCode", "stdout", "stderr", "error",
+                "startedAt", "finishedAt", "startedAtKst", "finishedAtKst",
+            ])
         filter_label = f' — job: {html.escape(job_id[:12])}' if job_id else ""
         nav = _nav_links("runs")
-        body = f"""
-<div class="header">
-  <div>
-    <h1>실행 이력{filter_label}</h1>
-    <span class="subtitle">{nav}</span>
-  </div>
-</div>
-<div class="card">
-  <table class="runs-table">
-    <thead><tr><th>Run ID</th><th>Status</th><th>Exit</th><th>Started</th><th>Finished</th><th>Error/Stderr</th></tr></thead>
-    <tbody>{''.join(rows) if rows else '<tr><td colspan="6" class="empty">실행 이력 없음</td></tr>'}</tbody>
-  </table>
-</div>
-"""
+        columns = [
+            {"field": "id", "headerName": "Run ID", "width": 260, "filter": "agTextColumnFilter"},
+            {"field": "jobId", "headerName": "Job ID", "width": 260, "filter": "agTextColumnFilter"},
+            {"field": "status", "width": 140, "filter": "agSetColumnFilter"},
+            {"field": "exitCode", "headerName": "Exit", "width": 110, "filter": "agNumberColumnFilter"},
+            {"field": "startedAtKst", "headerName": "Started (KST)", "width": 230, "filter": "agTextColumnFilter"},
+            {"field": "finishedAtKst", "headerName": "Finished (KST)", "width": 230, "filter": "agTextColumnFilter"},
+            {"field": "stdout", "headerName": "Stdout", "width": 420, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "stderr", "headerName": "Stderr", "width": 420, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "error", "headerName": "Error", "width": 360, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "searchText", "headerName": "Search Text", "hide": True, "filter": "agTextColumnFilter"},
+        ]
+        extra_controls = f'<a class="grid-link" href="/runs{("?jobId=" + html.escape(job_id) + "&") if job_id else "?"}limit=5000">최대 5000건</a>'
+        body = _grid_page_body(
+            title=f"실행 이력{filter_label}",
+            subtitle=f"limit={safe_limit}",
+            nav=nav,
+            grid_id="runs-grid",
+            rows=runs,
+            columns=columns,
+            extra_controls=extra_controls,
+        )
         self._send(HTTPStatus.OK, _html_page("실행 이력", body))
 
-
-
     def _render_messages(self, session_id: str | None, limit: int) -> None:
-        """메시지 목록 페이지를 렌더링합니다."""
-        messages = self.store.list_messages(session_id=session_id, limit=limit)
-        rows = []
+        """메시지 목록 페이지를 AG Grid로 렌더링한다."""
+        safe_limit = max(1, min(int(limit or 500), 5000))
+        messages = self.store.list_messages(session_id=session_id, limit=safe_limit)
         for msg in messages:
-            content_raw = msg.get("content") or ""
-            # role 미리보기
-            content_preview = html.escape(_truncate(content_raw, 120))
-            # content 전체 보기
-            _CONTENT_DISPLAY_CAP = 1000
-            if len(content_raw) > _CONTENT_DISPLAY_CAP:
-                content_capped = html.escape(content_raw[:_CONTENT_DISPLAY_CAP]) + "\n…[truncated – showing first 1000 chars]"
-            else:
-                content_capped = html.escape(content_raw)
-            show_details = len(content_raw) > 120
-            content_cell = f"""<details><summary>{content_preview}</summary><pre style="white-space:pre-wrap;max-height:300px;overflow:auto;margin-top:6px;">{content_capped}</pre></details>""" if show_details else f"<span>{content_preview}</span>"
-            rows.append(f"""
-<tr>
-  <td class="mono">{html.escape(str(msg['id'])[:12])}</td>
-  <td class="mono">{html.escape(str(msg.get('createdAt') or '-'))}</td>
-  <td class="mono">{html.escape(str(msg.get('sessionId') or '-')[:12])}</td>
-  <td>{html.escape(str(msg.get('role') or '-'))}</td>
-  <td>{html.escape(str(msg.get('agent') or '-'))}</td>
-  <td>{msg.get('isSession', False)}</td>
-  <td>{msg.get('order', 0)}</td>
-  <td style="max-width:400px;overflow:hidden;">{content_cell}</td>
-</tr>""")
+            msg["createdAtKst"] = _format_kst(msg.get("createdAt"))
+            msg["searchText"] = "\n".join(str(msg.get(key) or "") for key in [
+                "id", "sessionId", "role", "agent", "content", "createdAt", "createdAtKst", "order",
+            ])
         filter_label = f' — session: {html.escape(session_id[:12])}' if session_id else ""
         nav = _nav_links("messages")
-        body = f"""
-<div class="header">
-  <div>
-    <h1>Messages{filter_label}</h1>
-    <span class="subtitle">{nav}</span>
-  </div>
-</div>
-<div class="card">
-  <table class="runs-table">
-    <thead><tr><th>ID</th><th>Created</th><th>Session ID</th><th>Role</th><th>Agent</th><th>isSession</th><th>Order</th><th>Content</th></tr></thead>
-    <tbody>{''.join(rows) if rows else '<tr><td colspan="8" class="empty">메시지 없음</td></tr>'}</tbody>
-  </table>
-</div>
-"""
+        columns = [
+            {"field": "id", "headerName": "ID", "width": 120, "filter": "agNumberColumnFilter"},
+            {"field": "createdAtKst", "headerName": "Created (KST)", "width": 230, "filter": "agTextColumnFilter"},
+            {"field": "sessionId", "headerName": "Session ID", "width": 280, "filter": "agTextColumnFilter"},
+            {"field": "role", "width": 130, "filter": "agSetColumnFilter"},
+            {"field": "agent", "width": 130, "filter": "agSetColumnFilter"},
+            {"field": "isSession", "headerName": "isSession", "width": 130, "filter": "agSetColumnFilter"},
+            {"field": "order", "width": 110, "filter": "agNumberColumnFilter"},
+            {"field": "content", "headerName": "Content", "width": 720, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "searchText", "headerName": "Search Text", "hide": True, "filter": "agTextColumnFilter"},
+        ]
+        base = f"/messages?sessionId={html.escape(session_id)}&" if session_id else "/messages?"
+        extra_controls = f'<a class="grid-link" href="{base}limit=5000">최대 5000건</a>'
+        body = _grid_page_body(
+            title=f"Messages{filter_label}",
+            subtitle=f"limit={safe_limit}",
+            nav=nav,
+            grid_id="messages-grid",
+            rows=messages,
+            columns=columns,
+            extra_controls=extra_controls,
+        )
         self._send(HTTPStatus.OK, _html_page("Messages", body))
+
+    def _render_workflow_decisions(self, limit: int) -> None:
+        """workflow_decisions 목록 페이지를 AG Grid로 렌더링한다."""
+        safe_limit = max(1, min(int(limit or 500), 5000))
+        decisions = self.store.list_workflow_decisions(limit=safe_limit)
+        for decision in decisions:
+            decision["createdAtKst"] = _format_kst(decision.get("createdAt"))
+            decision["searchText"] = "\n".join(str(decision.get(key) or "") for key in [
+                "id", "workflowId", "workflowTitle", "workflowObjective", "workflowStatus", "sequence",
+                "stage", "role", "agent", "sourceRunId", "sourceSessionId", "expectedDecision", "decision",
+                "summary", "findingsText", "nextAction", "evidenceSummary", "promptSummary", "promptHash", "status",
+                "metadataText", "createdAt", "createdAtKst",
+            ])
+        nav = _nav_links("workflow decisions")
+        columns = [
+            {"field": "createdAtKst", "headerName": "Created (KST)", "width": 230, "filter": "agTextColumnFilter"},
+            {"field": "workflowTitle", "headerName": "Workflow", "width": 260, "filter": "agTextColumnFilter"},
+            {"field": "workflowStatus", "headerName": "Workflow Status", "width": 170, "filter": "agSetColumnFilter"},
+            {"field": "sequence", "width": 120, "filter": "agNumberColumnFilter"},
+            {"field": "stage", "width": 160, "filter": "agSetColumnFilter"},
+            {"field": "role", "width": 140, "filter": "agSetColumnFilter"},
+            {"field": "agent", "width": 130, "filter": "agSetColumnFilter"},
+            {"field": "decision", "width": 170, "filter": "agTextColumnFilter"},
+            {"field": "status", "width": 150, "filter": "agSetColumnFilter"},
+            {"field": "summary", "width": 420, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "findingsText", "headerName": "Findings", "width": 420, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "evidenceSummary", "headerName": "Evidence", "width": 420, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "nextAction", "headerName": "Next Action", "width": 360, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "sourceRunId", "headerName": "Source Run", "width": 260, "filter": "agTextColumnFilter"},
+            {"field": "sourceSessionId", "headerName": "Source Session", "width": 280, "filter": "agTextColumnFilter"},
+            {"field": "workflowId", "headerName": "Workflow ID", "width": 280, "filter": "agTextColumnFilter"},
+            {"field": "promptSummary", "headerName": "Prompt Summary", "width": 380, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "workflowObjective", "headerName": "Objective", "width": 420, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "metadataText", "headerName": "Metadata", "width": 360, "cellRenderer": "textPreviewRenderer", "filter": "agTextColumnFilter"},
+            {"field": "searchText", "headerName": "Search Text", "hide": True, "filter": "agTextColumnFilter"},
+        ]
+        extra_controls = '<a class="grid-link" href="/workflow-decisions?limit=5000">최대 5000건</a>'
+        body = _grid_page_body(
+            title="Workflow Decisions",
+            subtitle=f"limit={safe_limit}",
+            nav=nav,
+            grid_id="workflow-decisions-grid",
+            rows=decisions,
+            columns=columns,
+            extra_controls=extra_controls,
+        )
+        self._send(HTTPStatus.OK, _html_page("Workflow Decisions", body))
 
 
 def _start_web_ui() -> None:
-    """Web UI 서버를 시작합니다."""
+    """로컬 Web UI 서버를 백그라운드로 시작한다."""
     global _web_server, _web_thread
     if not _env_flag("ORCH_WEB_ENABLED", True):
         _log("web.disabled")
@@ -3350,7 +3374,7 @@ def _start_web_ui() -> None:
 
 
 def _stop_web_ui() -> None:
-    """Web UI 서버를 중지합니다."""
+    """실행 중인 Web UI 서버를 정지한다."""
     global _web_server, _web_thread
     if _web_server is None:
         return
@@ -3367,29 +3391,29 @@ def _stop_web_ui() -> None:
 # ---------------------------------------------------------------------------
 
 def _get_root_dir() -> Path:
-    """프로젝트 루트 디렉터리를 반환합니다."""
+    """ORCH_ROOT_DIR 또는 기본값에서 루트 디렉토리를 결정한다."""
     return Path(__file__).resolve().parents[1]
 
 
 def _get_base_dir() -> Path:
-    """CLI 실행 시 기본 작업 디렉터리를 반환한다."""
+    """CLI 실행 시의 기본 작업 디렉토리를 반환한다."""
     return BASE_DIR
 
 
 def _get_db_path() -> Path:
-    """SQLite 데이터베이스 경로를 반환합니다."""
+    """ORCH_DB_PATH 또는 기본값에서 DB 경로를 결정한다."""
     if DB_PATH is not None:
         return DB_PATH.resolve()
     return Path(os.getenv("ORCH_DB_PATH", str(_get_root_dir() / "data" / "orchestrator.sqlite"))).resolve()
 
 
 def _get_transport() -> Transport:
-    """MCP 전송 방식을 반환합니다."""
+    """MCP 서버의 transport 종별을 결정한다."""
     return "streamable-http"
 
 
 async def _run_mcp_server_async() -> None:
-    """비동기 MCP 서버를 실행합니다."""
+    """FastMCP 서버를 비동기로 시작한다."""
     import uvicorn
 
     starlette_app = mcp.streamable_http_app()
@@ -3407,14 +3431,14 @@ async def _run_mcp_server_async() -> None:
 
 
 def _get_store() -> SessionStore:
-    """초기화된 저장소 인스턴스를 반환합니다."""
+    """초기화 완료된 SessionStore를 취득한다."""
     if _store is None:
         raise RuntimeError("session store is not initialized")
     return _store
 
 
 def _mark_running_interrupted(connection: sqlite3.Connection, *, reason: str) -> None:
-    """실행 중인 스케줄 작업을 중단 상태로 표시합니다."""
+    """시작 시 잔존하는 running 스케줄을 interrupted로 정리한다."""
     now = _now_iso()
     connection.execute(
         "UPDATE scheduled_runs SET status = 'failed', finished_at = ?, error = ? WHERE status = 'running'",
@@ -3425,8 +3449,8 @@ def _mark_running_interrupted(connection: sqlite3.Connection, *, reason: str) ->
 
 
 def _reset_stuck_running_jobs(connection: sqlite3.Connection) -> None:
-    """서버 재시작 시 이전 비정상 종료로 running=1이 남은 잡을 리셋한다."""
-    _mark_running_interrupted(connection, reason="서버 재시작으로 중단되었습니다")
+    """서버 재시작 시 남은 running 상태를 실패로 리셋한다."""
+    _mark_running_interrupted(connection, reason="서버 재시작으로 인해 중단되었습니다")
     _log("startup.reset_stuck_jobs")
 
 
@@ -3479,7 +3503,7 @@ def _shutdown() -> None:
             _log("shutdown.active_schedule_runs_interrupted", grace_seconds=grace_seconds)
     if _connection is not None:
         with contextlib.suppress(Exception):
-            _mark_running_interrupted(_connection, reason="서버 종료로 중단되었습니다")
+            _mark_running_interrupted(_connection, reason="서버 종료로 인해 중단되었습니다")
         _connection.close()
     _connection = None
     _store = None
@@ -3487,7 +3511,7 @@ def _shutdown() -> None:
 
 @contextlib.asynccontextmanager
 async def server_lifespan(_: FastMCP) -> AsyncIterator[None]:
-    """서버 lifespan 컨텍스트를 제공합니다."""
+    """MCP 서버의 lifespan 중에 Web UI와 scheduler를 관리한다."""
     yield
 
 
@@ -3509,65 +3533,226 @@ mcp = FastMCP(
 
 @mcp.tool(name="orchestrator_usage", description="이 MCP 서버의 사용 가이드를 반환합니다. AI가 도구를 올바르게 호출하기 위한 절차와 예시를 포함합니다.")
 def orchestrator_usage() -> dict[str, Any]:
-    """사용 가이드와 권장 절차를 반환합니다."""
+    """AI 에이전트가 이 MCP 서버의 도구군을 올바르게 사용하기 위한 가이드를 반환한다."""
     _log_tool_call("orchestrator_usage")
     guide = {
         "overview": (
-            "이 서버는 Claude/Codex CLI를 세션 기반으로 실행하는 오케스트레이터입니다."
-            " user/assistant 메시지 이력을 세션에 저장해 문맥을 유지한 대화를 이어갈 수 있습니다."
+            "이 서버는 Claude/Codex CLI를 세션 관리 하에 실행하는 오케스트레이터입니다."
+            "user/assistant의 메시지 이력을 세션에 저장하고, 문맥을 유지한 대화가 가능합니다."
         ),
-        "recommendedFlow": [
-            "1. orchestrator_health로 서버 상태를 확인합니다(선택).",
-            "2. session_create로 세션을 만들거나 agent_run이 자동으로 세션을 만들게 둡니다.",
-            "3. agent_run으로 Claude/Codex에 질문을 보내고 응답을 받습니다.",
-            "4. 같은 sessionId로 agent_run을 반복하면 대화가 이어집니다.",
-            "5. session_get으로 과거 대화 이력을 확인할 수 있습니다.",
-            "6. workflow_create / workflow_decision_append / workflow_get으로 판단 로그를 구조화해 저장할 수 있습니다.",
-            "7. 120초를 넘길 수 있는 실행은 agent_run_start로 시작하고 agent_run_status로 polling 합니다.",
+        "workflow": [
+            "1. orchestrator_health로 서버가 정상인지 확인한다(임의)",
+            "2. session_create로 세션을 생성한다(생략 가능 — agent_run_start가 자동 생성)",
+            "3. 메인 실행 경로에서는 agent_run_start로 Claude/Codex 실행을 시작한다",
+            "4. 반환된 runId를 agent_run_status로 polling하여, completed=true의 result를 취득한다",
+            "5. 동일 sessionId로 agent_run_start를 반복하면 대화가 계속된다",
+            "6. session_get으로 과거 대화 이력을 확인할 수 있다",
+            "7. workflow_create / workflow_decision_append / workflow_get으로 판단 로그를 구조화하여 축적할 수 있다",
+            "8. agent_run은 짧은 연결 확인 등, 호출측이 동기 대기를 명시적으로 허용하는 예외 용도로 한정한다",
         ],
-        "changeWorkflow": [
-            "1. 변경 작업은 먼저 Codex로 구현 계획 초안을 만들고 대상 파일, 제약, 검증 방법을 명시합니다.",
-            "2. 구현 전에 Claude로 plan-review를 받아 누락 범위, 리스크, 검증 관점, 승인 경계를 점검합니다.",
-            "3. plan-review가 통과되거나 우려 사항이 해소되기 전까지는 대상 파일 쓰기를 시작하지 않습니다.",
-            "4. 승인 후 계획 범위만 구현하고, 사용자 요청 밖 파일이나 금지 경로는 건드리지 않습니다.",
-            "5. 구현 후 로컬 검증을 수행하고 문법, 차이점, 대상 파일 범위를 증거로 남깁니다.",
-            "6. 최종 결과는 Codex와 Claude 양쪽에서 result-review 형태로 확인하고 status, findings, next action을 받습니다.",
-            "7. 장시간 실행 중에는 agent_run_status로 프로세스/stdout/stderr 활동을 확인할 수 있습니다. 내부 모델 추론은 직접 관찰되지 않습니다.",
-            "8. 리뷰가 fail 또는 blocking/major finding이면 수정 후 다시 리뷰하고 완료 보고합니다.",
+        "collaboration_workflow": [
+            "1. 변경 작업에서는 먼저 Codex에 구현 계획의 초안을 작성시키고, 대상 파일, 제약, 검증 방법을 명시시킨다",
+            "2. 구현 전에 Claude에 plan-review를 의뢰하고, 스코프 누락, 리스크, 검증 관점, 승인 경계를 확인시킨다",
+            "3. plan-review가 pass 또는 대응 완료 concerns가 될 때까지 대상 파일의 쓰기를 시작하지 않는다",
+            "4. 승인 후, 계획에 포함된 범위만 구현하고, 사용자 요구 외의 파일이나 금지 경로에는 접근하지 않는다",
+            "5. 구현 후 로컬 검증을 실행하고, 구문, 차분, 대상 파일 범위를 증거로 남긴다",
+            "6. 최종 결과는 Codex와 Claude 양쪽에 result-review로 확인시키고, status, findings, next action을 수신한다",
+            "7. 장시간 실행 시에는 agent_run_status로 프로세스/stdout/stderr의 활동을 확인할 수 있다. 단 내부 모델 추론은 직접 관측할 수 없다",
+            "8. 리뷰가 fail 또는 blocking/major finding을 반환한 경우는, 시정 후 재리뷰한 뒤 완료 보고한다",
         ],
-        "tools": [
-            {"name": "orchestrator_health", "purpose": "서버 상태 확인", "params": "없음"},
-            {"name": "orchestrator_usage", "purpose": "이 사용 가이드 조회", "params": "없음"},
-            {"name": "session_create", "purpose": "새 세션 생성 및 초기 메시지 저장", "params": {"title": "(선택) 세션 이름", "messages": "(선택) [{role: 'user'|'assistant', content: '...'}] 형식의 초기 메시지 배열"}},
-            {"name": "session_get", "purpose": "세션 전체 메시지 이력 조회", "params": {"sessionId": "(필수) 세션 ID"}},
-            {"name": "session_list", "purpose": "최근 세션 목록 조회", "params": {"limit": "(선택) 조회 개수. 기본 20, 최대 100"}},
-            {"name": "session_append", "purpose": "기존 세션에 메시지를 수동 추가", "params": {"sessionId": "(필수) 세션 ID"}},
-            {"name": "session_delete", "purpose": "세션과 전체 메시지 삭제", "params": {"sessionId": "(필수) 세션 ID"}},
-            {"name": "workflow_create", "purpose": "계획/리뷰/실행/재리뷰 등의 판단을 묶는 workflow 생성", "params": {"title": "(선택) 제목", "objective": "(선택) 목표", "metadata": "(선택) raw prompt를 포함하지 않는 보조 JSON"}},
-            {"name": "workflow_decision_append", "purpose": "workflow에 stage/role 단위 판단 로그 추가", "params": {"workflowId": "(필수) workflow_create가 반환한 ID", "stage": "(필수) plan / plan-review / execute / result-review / ng-fix / re-review 등", "role": "(필수) claude / codex / user / system", "decision": "(선택) approved / rejected / completed / needs-fix 등", "summary": "(선택) 판단 요약. raw prompt는 저장하지 않음"}},
-            {"name": "workflow_get", "purpose": "workflow와 decision 이력 조회", "params": {"workflowId": "(필수) workflow ID", "includeDecisions": "(선택) decision 포함 여부. 기본 true", "limit": "(선택) decision 조회 수. 기본 50, 최대 500"}},
-            {"name": "workflow_list", "purpose": "최근 업데이트된 workflow 목록 조회", "params": {"status": "(선택) active/completed/failed 등", "limit": "(선택) 기본 20, 최대 100"}},
-            {"name": "agent_run", "purpose": "Claude 또는 Codex CLI 실행 후 결과를 세션에 저장", "params": {"agent": "(필수) 'claude' 또는 'codex'", "prompt": "(필수) 사용자 질문 텍스트", "promptBase64": "(선택) prompt를 Base64로 전달할 때 사용", "useSession": "(선택) true이면 세션 이력 사용. 기본 true", "sessionId": "(선택) 기존 세션 ID. 생략하면 새로 생성", "messages": "(선택) 추가 컨텍스트 메시지 [{role, content}]", "filePaths": "(선택) 서버가 UTF-8로 직접 읽어 Claude 프롬프트에 주입할 로컬 파일 경로 배열", "allowedToolsPattern": "(선택) Claude CLI에 전달할 허용 도구 패턴", "skipPermissions": "(선택) Claude 권한 체크 우회 여부. 기본 false", "codexMcpApprovedTools": "(선택) Codex에 사전 승인할 MCP tool의 server.tool 배열(read/범용)", "codexMcpApprovedWriteTools": "(선택) Codex에 사전 승인할 write MCP tool의 server.tool 배열", "approveCodexMcpWrites": "(선택) write MCP tool 사전 승인을 활성화하는 명시 플래그. 기본 false", "cwd": "(선택) CLI 실행 디렉터리", "timeoutMs": f"(선택) 하드 타임아웃 ms. 기본 {DEFAULT_TIMEOUT_MS}", "extraArgs": "(선택) CLI 추가 인수 배열", "workflow": "(선택) {id, stage, role, expectedDecision, promptSummary, decision, summary, findings, nextAction, evidenceSummary, metadata}"}, "returns": {"sessionId": "사용된 세션 ID", "status": "'completed' 또는 'failed'", "stdout": "CLI 표준 출력(응답 본문)", "stderr": "CLI 표준 오류 출력", "exitCode": "프로세스 종료 코드(0=성공)"}},
-            {"name": "agent_run_start", "purpose": "장시간 실행용으로 Claude 또는 Codex CLI를 백그라운드 시작하고 runId/sessionId를 즉시 반환", "params": {"agent": "(필수) 'claude' 또는 'codex'", "prompt": "(필수) 사용자 질문 텍스트. promptBase64 사용 가능", "useSession": "(선택) 세션 이력 사용 여부. 기본 true", "sessionId": "(선택) 기존 세션 ID. 생략하면 시작 전에 새로 생성", "filePaths": "(선택) Claude prompt에 주입할 로컬 파일 경로 배열", "allowedToolsPattern": "(선택) Claude CLI 허용 도구 패턴", "skipPermissions": "(선택) Claude 권한 체크 우회 여부", "codexMcpApprovedTools": "(선택) Codex에 사전 승인할 MCP tool 배열", "approveCodexMcpWrites": "(선택) Codex write MCP 승인 활성화 여부", "cwd": "(선택) CLI 실행 디렉터리", "timeoutMs": f"(선택) 하드 타임아웃 ms. 기본 {DEFAULT_TIMEOUT_MS}"}, "returns": {"runId": "agent_run_status로 polling할 run ID", "sessionId": "결과 대화를 session_get으로 가져오기 위한 session ID"}, "guidance": "agent_run_status(runId)로 completed=true가 될 때까지 확인합니다."},
-            {"name": "agent_run_status", "purpose": "실행 중 agent_run의 프로세스/I/O 상태 반환", "params": {"runId": "(선택) 실행 중 runId. 생략하면 전체 실행 중 run 목록 반환"}, "returns": {"running": "runId 지정 시 실행 중 여부", "completed": "완료 캐시에 있으면 true", "result": "완료 캐시에 있을 때 최종 결과(compiledPrompt 제외)", "count": "runId 생략 시 실행 중 건수", "runs": "실행 중 run의 elapsedSec, idleSec, stdoutLines, stderrLines 등", "recentCompleted": "최근 완료 run 요약 목록. stdout/stderr 본문은 포함하지 않음"}},
-        ],
+        "tools": {
+            "orchestrator_health": {
+                "purpose": "서버 상태 확인",
+                "params": "없음",
+            },
+            "orchestrator_usage": {
+                "purpose": "이 사용 가이드를 취득",
+                "params": "없음",
+            },
+            "session_create": {
+                "purpose": "신규 세션 생성. 초기 메시지를 전달할 수도 있음",
+                "params": {
+                    "title": "(임의) 세션명",
+                    "messages": "(임의) [{role: 'user'|'assistant', content: '...'}] 형식의 초기 메시지 배열",
+                },
+            },
+            "session_get": {
+                "purpose": "세션의 전체 메시지 이력을 취득",
+                "params": {"sessionId": "(필수) 세션 ID"},
+            },
+            "session_list": {
+                "purpose": "최근 세션 목록을 취득",
+                "params": {"limit": "(임의) 취득 건수. 기본 20, 최대 100"},
+            },
+            "session_append": {
+                "purpose": "기존 세션에 메시지를 수동 추가(CLI 실행 없이 이력만 추가하고 싶을 때)",
+                "params": {
+                    "sessionId": "(필수) 세션 ID",
+                    "messages": "(필수) [{role, content}] 배열",
+                },
+            },
+            "session_delete": {
+                "purpose": "세션과 전체 메시지를 삭제",
+                "params": {"sessionId": "(필수) 세션 ID"},
+            },
+            "workflow_create": {
+                "purpose": "계획, 리뷰, 실행, 재리뷰 등의 의사결정을 묶는 workflow를 생성",
+                "params": {
+                    "title": "(임의) workflow 명",
+                    "objective": "(임의) 작업 목적",
+                    "metadata": "(임의) raw prompt를 포함하지 않는 보충 JSON",
+                },
+            },
+            "workflow_decision_append": {
+                "purpose": "workflow에 stage/role 단위의 판단 로그를 추가",
+                "params": {
+                    "workflowId": "(필수) workflow_create가 반환한 ID",
+                    "stage": "(필수) plan / plan-review / execute / result-review / ng-fix / re-review 등",
+                    "role": "(필수) main / sub / planner / executor / reviewer / agent / system",
+                    "decision": "(임의) approved / rejected / completed / needs-fix 등의 판단",
+                    "summary": "(임의) 판단 요약. raw prompt는 저장하지 않음",
+                    "findings": "(임의) finding 배열",
+                    "evidenceSummary": "(임의) 근거 요약",
+                },
+            },
+            "workflow_get": {
+                "purpose": "workflow와 decision 이력을 취득",
+                "params": {
+                    "workflowId": "(필수) workflow ID",
+                    "includeDecisions": "(임의) decision을 포함할지 여부. 기본 true",
+                    "limit": "(임의) decision 취득 건수. 기본 50, 최대 500",
+                    "offset": "(임의) decision 취득 시작 위치",
+                },
+            },
+            "workflow_list": {
+                "purpose": "최근 갱신된 workflow 목록을 취득",
+                "params": {"status": "(임의) active/completed/failed 등", "limit": "(임의) 기본 20, 최대 100"},
+            },
+            "agent_run": {
+                "purpose": "단시간 연결 확인 등 예외 용도로 Claude 또는 Codex CLI를 동기 실행하고, 결과를 세션에 저장",
+                "params": {
+                    "agent": "(필수) 'claude' 또는 'codex'",
+                    "prompt": "(필수) 사용자의 질문 텍스트",
+                    "promptBase64": "(임의) prompt를 Base64 인코딩으로 전달할 때 사용",
+                    "useSession": "(임의) true: 세션 이력을 사용. 기본 true",
+                    "sessionId": "(임의) 기존 세션 ID. 생략 시 신규 생성",
+                    "messages": "(임의) 추가 컨텍스트 메시지 [{role, content}]",
+                    "filePaths": "(임의) 서버가 UTF-8로 직접 읽어서 Claude 프롬프트에 주입하는 로컬 파일 경로 배열",
+                    "allowedToolsPattern": "(임의) Claude CLI에 전달하는 허가 도구 패턴. 기본 None(자동 부여 없음)",
+                    "skipPermissions": "(호환용) 수신하지만 agent 실행 로직에 전달하지 않음",
+                    "codexMcpApprovedTools": "(호환용) 수신하지만 agent 실행 로직에 전달하지 않음",
+                    "codexMcpApprovedWriteTools": "(호환용) 수신하지만 agent 실행 로직에 전달하지 않음",
+                    "approveCodexMcpWrites": "(호환용) 수신하지만 agent 실행 로직에 전달하지 않음",
+                    "cwd": "(임의) CLI 실행 디렉토리",
+                    "timeoutMs": f"(임의) 하드 타임아웃 ms(최대 상한). 기본 {DEFAULT_TIMEOUT_MS}",
+                    "extraArgs": "(임의) CLI에 전달하는 추가 인수 문자열 배열",
+                    "workflow": "(임의) {id, stage, role, expectedDecision, promptSummary, decision, summary, findings, nextAction, evidenceSummary, metadata}. id 지정 시 실행 후 decision을 자동 추가",
+                },
+                "returns": {
+                    "sessionId": "사용된 세션 ID",
+                    "status": "'completed' 또는 'failed'",
+                    "stdout": "CLI 표준 출력(응답 본문)",
+                    "stderr": "CLI 표준 에러 출력",
+                    "exitCode": "프로세스 종료 코드(0 = 성공)",
+                },
+                "timeout_behavior": {
+                    "description": "동기 실행용 활성도 기반 타임아웃. 메인 실행 경로에서는 agent_run_start를 사용",
+                    "idle_timeout": f"ORCH_IDLE_TIMEOUT_SEC초 동안 stdout/stderr에 출력이 없으면 idle timeout(기본 {DEFAULT_IDLE_TIMEOUT_SEC}초)",
+                    "hard_timeout": "timeoutMs는 절대 상한. 출력이 있어도 초과하면 강제 종료",
+                    "alive_log": "실행 중에는 ORCH_ALIVE_LOG_INTERVAL_SEC초마다 cli.alive 로그를 출력(기본 30초)",
+                    "mcp_progress_heartbeat": (
+                        "agent_run은 FastMCP Context.report_progress를 "
+                        f"{AGENT_RUN_PROGRESS_INTERVAL_SEC}초마다 전송하지만, client 구현에 따라 동기 tool-call timeout을 완전히 피할 수 없을 수 있음"
+                    ),
+                    "observability_note": _ACTIVE_RUN_OBSERVABILITY_NOTE,
+                    "env_vars": {
+                        "ORCH_IDLE_TIMEOUT_SEC": f"유휴 타임아웃 초수(기본 {DEFAULT_IDLE_TIMEOUT_SEC})",
+                        "ORCH_ALIVE_LOG_INTERVAL_SEC": "활성 로그 출력 간격 초수(기본 30)",
+                    },
+                },
+                "claude_allowed_tools_behavior": {
+                    "description": "Claude -p는 비대화 모드이므로, allowedToolsPattern 또는 ORCH_CLAUDE_ALLOWED_TOOLS로 명시된 tool만 --allowedTools에 추가",
+                    "default_tools": list(DEFAULT_TOOL_APPROVALS["claude_allowed_tools"]),
+                    "source_defaults": {
+                        "DEFAULT_TOOL_APPROVALS.claude_allowed_tools": list(DEFAULT_TOOL_APPROVALS["claude_allowed_tools"]),
+                        "DEFAULT_TOOL_APPROVALS.allow_broad_patterns": bool(DEFAULT_TOOL_APPROVALS["allow_broad_patterns"]),
+                    },
+                    "override_env": "ORCH_CLAUDE_ALLOWED_TOOLS에 쉼표 또는 공백 구분으로 지정. 광범위 허가(*, mcp__*, server.*)에는 ORCH_ALLOW_BROAD_TOOL_PATTERNS=true 또는 DEFAULT_TOOL_APPROVALS['allow_broad_patterns']=True가 필요",
+                },
+                "codex_cli_behavior": {
+                    "description": "Codex exec는 추가 CLI 옵션 없이 실행. 호환용 옵션은 수신하지만 agent 실행 로직에 전달하지 않음",
+                },
+                "example": {
+                    "call": 'agent_run(agent="claude", prompt="Return exactly: OK", useSession=false)',
+                    "continuation": '통상 계속 실행은 agent_run_start(agent="claude", prompt="재귀 버전으로 변환해줘", sessionId="<이전 sessionId>")를 사용',
+                },
+            },
+            "agent_run_start": {
+                "purpose": "메인 실행 경로로서 Claude 또는 Codex CLI를 백그라운드 시작하고, runId/sessionId를 즉시 반환",
+                "params": {
+                    "agent": "(필수) 'claude' 또는 'codex'",
+                    "prompt": "(필수) 사용자의 질문 텍스트. promptBase64도 이용 가능",
+                    "useSession": "(임의) 세션 이력을 사용할지. 기본 true",
+                    "sessionId": "(임의) 기존 세션 ID. 생략 시 시작 전에 신규 생성",
+                    "filePaths": "(임의) Claude prompt에 주입하는 로컬 파일 경로 배열",
+                    "allowedToolsPattern": "(임의) Claude CLI에 전달하는 허가 도구 패턴",
+                    "skipPermissions": "(호환용) 수신하지만 agent 실행 로직에 전달하지 않음",
+                    "codexMcpApprovedTools": "(호환용) 수신하지만 agent 실행 로직에 전달하지 않음",
+                    "codexMcpApprovedWriteTools": "(호환용) 수신하지만 agent 실행 로직에 전달하지 않음",
+                    "approveCodexMcpWrites": "(호환용) 수신하지만 agent 실행 로직에 전달하지 않음",
+                    "cwd": "(임의) CLI 실행 디렉토리",
+                    "timeoutMs": f"(임의) 하드 타임아웃 ms. 기본 {DEFAULT_TIMEOUT_MS}",
+                    "workflow": "(임의) workflow decision 자동 추가용 metadata",
+                },
+                "returns": {
+                    "runId": "agent_run_status로 polling하기 위한 run ID",
+                    "sessionId": "결과 대화를 session_get으로 취득하기 위한 session ID",
+                    "status": "'running'",
+                    "background": "true",
+                    "guidance": "agent_run_status(runId)로 completed=true가 될 때까지 확인",
+                },
+                "example": {
+                    "start": 'agent_run_start(agent="claude", prompt="조사 또는 리뷰를 실행해줘")',
+                    "poll": 'agent_run_status(runId="<start에서 반환된 runId>")',
+                    "session": 'session_get(sessionId="<start에서 반환된 sessionId>")',
+                },
+            },
+            "agent_run_status": {
+                "purpose": "실행 중 agent_run의 프로세스/I/O 상태를 반환",
+                "params": {
+                    "runId": "(임의) 실행 중 runId. 생략 시 전체 실행 중 run을 목록 반환",
+                },
+                "returns": {
+                    "running": "runId 지정 시 실행 중 플래그",
+                    "completed": "runId 지정 시, 완료 캐시에 존재하면 true",
+                    "result": "runId 지정 시, 완료 캐시에 존재하면 최종 결과(compiledPrompt는 제외)",
+                    "count": "runId 생략 시 실행 중 건수",
+                    "runs": "실행 중 run의 elapsedSec, idleSec, stdoutLines, stderrLines 등",
+                    "recentCompleted": "runId 생략 시 최근 완료 run 요약 목록. stdout/stderr 본문은 포함하지 않음",
+                    "note": _ACTIVE_RUN_OBSERVABILITY_NOTE,
+                },
+            },
+        },
         "notes": [
-            "role은 'user'와 'assistant'만 사용 가능합니다('system' 미지원).",
-            "세션을 사용하면 과거 user/assistant 메시지가 자동으로 프롬프트에 포함됩니다.",
-            "긴 프롬프트는 promptBase64로 Base64 인코딩해 전달할 수 있습니다.",
-            f"타임아웃은 활동도 기반입니다. ORCH_IDLE_TIMEOUT_SEC(기본 {DEFAULT_IDLE_TIMEOUT_SEC}초) 동안 stdout/stderr 출력이 없으면 idle timeout으로 종료됩니다.",
-            "timeoutMs는 절대 상한입니다.",
-            "실행 중에는 30초마다 cli.alive 로그가 출력되어 경과 시간, idle 시간, 출력 행 수를 확인할 수 있습니다.",
-            f"agent_run은 {AGENT_RUN_PROGRESS_INTERVAL_SEC}초마다 MCP progress heartbeat를 보내 장시간 실행 시 client 측 타임아웃을 줄입니다.",
-            "agent_run_status는 프로세스와 stdout/stderr 활동만 반환하며 내부 모델 추론 상태는 직접 보여주지 않습니다.",
+            "role은 'user'와 'assistant'만 사용 가능('system'은 미지원)",
+            "세션을 사용하면 과거 user/assistant 메시지가 자동으로 프롬프트에 포함됨",
+            "긴 프롬프트는 promptBase64로 Base64 인코딩하여 전달 가능",
+            "타임아웃은 활성도 기반: CLI가 stdout/stderr 출력을 계속하는 동안은 활동 중으로 간주하여 대기 연장."
+            f" ORCH_IDLE_TIMEOUT_SEC(기본 {DEFAULT_IDLE_TIMEOUT_SEC}초) 동안 출력이 없으면 idle timeout으로 강제 종료."
+            " timeoutMs는 하드 상한으로 기능",
+            "실행 중에는 30초마다 cli.alive 로그가 출력되어 현재 경과 시간, 유휴 시간, 출력 행수를 확인 가능",
+            "메인 실행 경로에서는 agent_run_start를 사용하고, agent_run_status polling으로 client 측 tool-call timeout을 회피",
+            f"agent_run은 {AGENT_RUN_PROGRESS_INTERVAL_SEC}초마다 MCP progress heartbeat를 전송하지만, client 구현에 따라 동기 tool-call timeout을 완전히 피할 수 없을 수 있음",
+            "agent_run_status는 프로세스와 stdout/stderr의 활동만 반환하며, 내부 모델 추론 상태는 직접 관측하지 않음",
         ],
     }
-    _log_tool_result("orchestrator_usage", {"tools": len(guide["tools"])})
+    _log_tool_result("orchestrator_usage", {"keys": list(guide.keys())})
     return guide
+
 
 @mcp.tool(name="orchestrator_health", description="서버 상태와 DB 경로를 반환합니다.")
 def orchestrator_health() -> dict[str, Any]:
-    """서버 상태와 DB 경로를 반환합니다."""
+    """MCP 서버의 헬스 정보를 반환한다."""
     _log_tool_call("orchestrator_health")
     result = {
         **_get_store().get_health(),
@@ -3579,30 +3764,30 @@ def orchestrator_health() -> dict[str, Any]:
     return result
 
 
-@mcp.tool(name="session_create", description="세션을 생성하고 초기 메시지를 저장합니다.")
+@mcp.tool(name="session_create", description="세션을 생성하고, 초기 메시지를 저장합니다.")
 def session_create(
     title: str | None = None,
     messages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """세션을 생성합니다."""
+    """session_create 처리를 실행한다."""
     _log_tool_call("session_create", title=title)
     result = _get_store().create_session(title=title, messages=messages)
     _log_tool_result("session_create", result)
     return result
 
 
-@mcp.tool(name="session_get", description="세션과 메시지 목록을 가져옵니다.")
+@mcp.tool(name="session_get", description="세션과 메시지 목록을 취득합니다.")
 def session_get(sessionId: str) -> dict[str, Any] | None:
-    """세션과 메시지 이력을 조회합니다."""
+    """MCP 경유로 지정 세션의 상세를 반환한다."""
     _log_tool_call("session_get", sessionId=sessionId)
     result = _get_store().get_session(sessionId)
     _log_tool_result("session_get", result)
     return result
 
 
-@mcp.tool(name="session_list", description="최근 세션 목록을 가져옵니다.")
+@mcp.tool(name="session_list", description="최근 세션 목록을 취득합니다.")
 def session_list(limit: int = 20) -> list[dict[str, Any]]:
-    """최근 세션 목록을 조회합니다."""
+    """MCP 경유로 최근 세션 목록을 반환한다."""
     _log_tool_call("session_list", limit=limit)
     result = _get_store().list_sessions(limit=limit)
     _log_tool_result("session_list", result)
@@ -3615,7 +3800,7 @@ def session_append(
     messages: list[dict[str, Any]],
     agent: str | None = None,
 ) -> dict[str, Any]:
-    """기존 세션에 메시지를 추가합니다."""
+    """MCP 경유로 기존 세션에 메시지를 추가한다."""
     _log_tool_call("session_append", sessionId=sessionId, agent=agent)
     result = _get_store().append_messages(session_id=sessionId, messages=messages, agent=agent)
     _log_tool_result("session_append", result)
@@ -3624,7 +3809,7 @@ def session_append(
 
 @mcp.tool(name="session_delete", description="세션과 관련 메시지를 삭제합니다.")
 def session_delete(sessionId: str) -> dict[str, Any]:
-    """세션과 관련 메시지를 삭제합니다."""
+    """MCP 경유로 지정 세션을 삭제한다."""
     _log_tool_call("session_delete", sessionId=sessionId)
     result = _get_store().delete_session(sessionId)
     _log_tool_result("session_delete", result)
@@ -3637,7 +3822,7 @@ def workflow_create(
     objective: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """workflow를 생성합니다."""
+    """MCP 경유로 workflow_runs를 생성한다."""
     _log_tool_call("workflow_create", title=title, objective=_truncate(objective or ""))
     result = _get_store().create_workflow(title=title, objective=objective, metadata=metadata)
     _log_tool_result("workflow_create", result)
@@ -3663,7 +3848,7 @@ def workflow_decision_append(
     status: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """workflow에 decision을 추가합니다."""
+    """MCP 경유로 workflow_decisions에 판단 기록을 추가한다."""
     _log_tool_call("workflow_decision_append", workflowId=workflowId, stage=stage, role=role, agent=agent)
     result = _get_store().append_workflow_decision(
         workflow_id=workflowId,
@@ -3687,14 +3872,14 @@ def workflow_decision_append(
     return result
 
 
-@mcp.tool(name="workflow_get", description="워크플로와 의사결정 이력을 가져옵니다.")
+@mcp.tool(name="workflow_get", description="워크플로와 의사결정 이력을 취득합니다.")
 def workflow_get(
     workflowId: str,
     includeDecisions: bool = True,
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any] | None:
-    """workflow 상세를 가져옵니다."""
+    """MCP 경유로 workflow와 decision 목록을 취득한다."""
     _log_tool_call("workflow_get", workflowId=workflowId, includeDecisions=includeDecisions, limit=limit, offset=offset)
     result = _get_store().get_workflow(
         workflowId,
@@ -3706,9 +3891,9 @@ def workflow_get(
     return result
 
 
-@mcp.tool(name="workflow_list", description="최근 업데이트된 워크플로 목록을 가져옵니다.")
+@mcp.tool(name="workflow_list", description="최근 갱신된 워크플로 목록을 취득합니다.")
 def workflow_list(status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
-    """workflow 목록 조회 도구."""
+    """MCP 경유로 workflow 목록을 취득한다."""
     _log_tool_call("workflow_list", status=status, limit=limit)
     result = _get_store().list_workflows(status=status, limit=limit)
     _log_tool_result("workflow_list", result)
@@ -3717,14 +3902,14 @@ def workflow_list(status: str | None = None, limit: int = 20) -> list[dict[str, 
 
 @mcp.tool(name="agent_run_status", description="실행 중 agent_run의 프로세스/I/O 상태를 반환합니다.")
 def agent_run_status(runId: str | None = None) -> dict[str, Any]:
-    """실행 중 agent_run 상태를 반환합니다."""
+    """MCP 경유로 실행 중 agent_run의 관측 가능 상태를 반환한다."""
     _log_tool_call("agent_run_status", runId=runId)
     result = _snapshot_active_runs(runId)
     _log_tool_result("agent_run_status", result)
     return result
 
 
-@mcp.tool(name="agent_run_start", description="Claude 또는 Codex CLI를 백그라운드에서 시작하고 runId를 즉시 반환합니다.")
+@mcp.tool(name="agent_run_start", description="Claude 또는 Codex CLI를 백그라운드로 시작하고, runId를 즉시 반환합니다.")
 def agent_run_start(
     agent: Literal["claude", "codex"],
     prompt: str = "",
@@ -3743,13 +3928,12 @@ def agent_run_start(
     extraArgs: list[str] | None = None,
     workflow: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """비동기 agent 실행을 시작합니다."""
+    """장시간 실행을 위해 agent 실행을 시작만 하고, 결과는 agent_run_status로 취득한다."""
     resolved_prompt = _resolve_text_value(prompt, promptBase64, field_name="prompt")
     if agent not in {"claude", "codex"}:
         raise ValueError("agent must be claude or codex")
     if not resolved_prompt:
         raise ValueError("prompt is required")
-    effective_skip_permissions = bool(skipPermissions)
     _log_tool_call(
         "agent_run_start",
         agent=agent,
@@ -3758,19 +3942,22 @@ def agent_run_start(
         sessionId=sessionId,
         filePaths=filePaths,
         allowedToolsPattern=allowedToolsPattern,
-        skipPermissions=effective_skip_permissions,
+        skipPermissions=skipPermissions,
         codexMcpApprovedTools=codexMcpApprovedTools,
         codexMcpApprovedWriteTools=codexMcpApprovedWriteTools,
         approveCodexMcpWrites=approveCodexMcpWrites,
+        legacyOptionsIgnored=_ignored_legacy_agent_option_names(
+            skipPermissions=skipPermissions,
+            codexMcpApprovedTools=codexMcpApprovedTools,
+            codexMcpApprovedWriteTools=codexMcpApprovedWriteTools,
+            approveCodexMcpWrites=approveCodexMcpWrites,
+        ),
         cwd=cwd,
         timeoutMs=timeoutMs,
         workflow=workflow,
     )
     user_extra_args: list[str] = list(extraArgs or [])
-    _validate_extra_args(user_extra_args)
     effective_extra_args: list[str] = list(user_extra_args)
-    if effective_skip_permissions and agent == "claude":
-        effective_extra_args.append("--dangerously-skip-permissions")
 
     store = _get_store()
     if sessionId:
@@ -3792,7 +3979,7 @@ def agent_run_start(
     )
 
     def _background_run() -> None:
-        """백그라운드 스레드에서 실제 agent 실행과 완료 캐시 적재를 수행한다."""
+        """agent_run_start의 백그라운드 실행 본체."""
         try:
             store.run_agent(
                 agent=agent,
@@ -3802,15 +3989,11 @@ def agent_run_start(
                 messages=messages,
                 file_paths=filePaths,
                 allowed_tools_pattern=allowedToolsPattern,
-                codex_mcp_approved_tools=codexMcpApprovedTools,
-                codex_mcp_approved_write_tools=codexMcpApprovedWriteTools,
-                approve_codex_mcp_writes=approveCodexMcpWrites,
                 cwd=cwd,
                 timeout_ms=timeoutMs,
                 extra_args=effective_extra_args,
                 workflow=workflow,
                 run_id=run_id,
-                _internal=effective_skip_permissions,
             )
             _forget_active_run(run_id)
         except Exception as exc:
@@ -3843,8 +4026,8 @@ def agent_run_start(
     return result
 
 
-# main agent run tool
-@mcp.tool(name="agent_run", description="Claude 또는 Codex CLI를 실행하고 필요 시 세션에 저장합니다.")
+# TODO: 향후 batch/client wrapper에서는 agent_run_start를 우선하고, agent_run의 단계적 폐지를 검토한다.
+@mcp.tool(name="agent_run", description="Claude 또는 Codex CLI를 실행하고, 필요에 따라 세션에 저장합니다.")
 async def agent_run(
     agent: Literal["claude", "codex"],
     prompt: str = "",
@@ -3865,9 +4048,8 @@ async def agent_run(
     *,
     ctx: Context,
 ) -> dict[str, Any]:
-    """동기 대기형 agent 실행 도구. 장시간 실행 시 progress heartbeat를 보낸다."""
+    """MCP 경유로 Claude 또는 Codex CLI를 실행한다."""
     resolved_prompt = _resolve_text_value(prompt, promptBase64, field_name="prompt")
-    effective_skip_permissions = bool(skipPermissions)
     _log_tool_call(
         "agent_run",
         agent=agent,
@@ -3876,19 +4058,22 @@ async def agent_run(
         sessionId=sessionId,
         filePaths=filePaths,
         allowedToolsPattern=allowedToolsPattern,
-        skipPermissions=effective_skip_permissions,
+        skipPermissions=skipPermissions,
         codexMcpApprovedTools=codexMcpApprovedTools,
         codexMcpApprovedWriteTools=codexMcpApprovedWriteTools,
         approveCodexMcpWrites=approveCodexMcpWrites,
+        legacyOptionsIgnored=_ignored_legacy_agent_option_names(
+            skipPermissions=skipPermissions,
+            codexMcpApprovedTools=codexMcpApprovedTools,
+            codexMcpApprovedWriteTools=codexMcpApprovedWriteTools,
+            approveCodexMcpWrites=approveCodexMcpWrites,
+        ),
         cwd=cwd,
         timeoutMs=timeoutMs,
         workflow=workflow,
     )
     user_extra_args: list[str] = list(extraArgs or [])
-    _validate_extra_args(user_extra_args)
     effective_extra_args: list[str] = list(user_extra_args)
-    if effective_skip_permissions and agent == "claude":
-        effective_extra_args.append("--dangerously-skip-permissions")
     run_fn = functools.partial(
         _get_store().run_agent,
         agent=agent,
@@ -3898,14 +4083,10 @@ async def agent_run(
         messages=messages,
         file_paths=filePaths,
         allowed_tools_pattern=allowedToolsPattern,
-        codex_mcp_approved_tools=codexMcpApprovedTools,
-        codex_mcp_approved_write_tools=codexMcpApprovedWriteTools,
-        approve_codex_mcp_writes=approveCodexMcpWrites,
         cwd=cwd,
         timeout_ms=timeoutMs,
         extra_args=effective_extra_args,
         workflow=workflow,
-        _internal=effective_skip_permissions,
     )
     loop = asyncio.get_running_loop()
     task = loop.run_in_executor(None, run_fn)
@@ -3930,7 +4111,7 @@ async def agent_run(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """MCP 서버 프로세스 진입점을 실행합니다."""
+    """프로세스 시작 시의 초기화, MCP 실행, shutdown 처리를 수행한다."""
     _configure_console_utf8()
     _install_runtime_guards()
     _log("process.start", file=__file__, transport=_get_transport())
